@@ -63,6 +63,19 @@ cp target/wasm32-wasip1/release/zellij-tab-quicksearch.wasm \
    ~/.config/zellij/plugins/tab-quicksearch.wasm
 ```
 
+### Option C — Termux (Android)
+
+Termux ships its Rust toolchain via `pkg` instead of `rustup`. The compiler and the WASI target's `std` come from two separate packages that **must be the same version** — otherwise the build fails with a flood of `cannot find Some/Option/Result in this scope` errors (the prelude can't be loaded because the metadata format mismatches).
+
+```bash
+pkg install rust rust-std-wasm32-wasip1
+cargo build --release --target wasm32-wasip1
+install -m 0644 target/wasm32-wasip1/release/zellij-tab-quicksearch.wasm \
+        ~/.config/zellij/plugins/tab-quicksearch.wasm
+```
+
+If `pkg install rust-std-wasm32-wasip1` pulls a newer version than the already-installed `rust`, run `pkg upgrade rust` (and any other `rust-std-*` packages) first to keep them in lockstep.
+
 ## Zellij configuration
 
 Add the plugin alias and a keybind to `~/.config/zellij/config.kdl`. Adjust to taste — Zellij's KDL requires a trailing `;` after each action inside a `bind` block:
