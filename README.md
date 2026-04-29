@@ -11,29 +11,29 @@ A floating, fuzzy-matching tab picker for [Zellij](https://zellij.dev) — open 
 
 - **Fuzzy search** powered by [nucleo-matcher](https://github.com/helix-editor/nucleo) (Helix's matcher) — smart case, unicode normalization, match highlighting.
 - **Frequency-based default order** — most-frequently-jumped tabs rise to the top when the query is empty. In-memory, session-scoped.
-- **Instant jump** — with an empty query, `1`–`9` jumps directly to that tab position.
+- **Instant jump** — pressing a digit on an empty query jumps to that tab by position. With 10+ tabs the picker buffers digits until the full position is typed or 0.4 s pass since the last keystroke.
 - **Active tab as separate header** — you can't jump to the tab you're already on, so it's shown above the list, not inside it.
-- **Bell indicator** — tabs with an active bell notification get a yellow `!` marker.
+- **Bell indicator** — tabs with an active bell notification get a blinking light-grey background highlight; the animation pauses automatically when you click into the pane behind the picker.
 - **Pane count per tab** — `[N]` on the right, with the picker-plugin itself subtracted from the active tab's count.
-- **Theme-adaptive colours** — uses 16-ANSI colour codes so the picker follows your Zellij theme.
+- **Theme-adaptive colours** — picker chrome uses 16-ANSI codes so it follows your Zellij theme; the bell highlight uses 256-colour palette 250 (a soft, near-white background).
 - **Frame-less** — `set_pane_borderless` removes the default Zellij frame for a clean modal look.
-- **Configurable size** — min/max absolute + max percentage for columns and rows, settable via the plugin alias.
+- **Configurable size** — `max_cols` and `max_rows` for the floating pane, settable via the plugin alias.
 - **Query auto-clear** — fresh query on every open.
 - **Graceful on tiny panes** — degrades to blank rather than breaking the frame.
 
 ## Keybindings (inside the picker)
 
-| Key                               | Action                                                     |
-| --------------------------------- | ---------------------------------------------------------- |
-| Any printable character           | Append to query (fuzzy filter)                             |
-| `1`–`9` (only with empty query)   | Instant jump to that tab position                          |
-| `↑` / `Ctrl-p` / `Ctrl-k`         | Move selection up                                          |
-| `↓` / `Tab` / `Ctrl-n` / `Ctrl-j` | Move selection down                                        |
-| `Enter`                           | Switch to the selected tab and close                       |
-| `Backspace`                       | Delete the last character                                  |
-| `Ctrl-w`                          | Delete the previous word                                   |
-| `Ctrl-u`                          | Clear the entire query                                     |
-| `Esc` / `Ctrl-c` / `Ctrl-g`       | Close the picker without switching                         |
+| Key                               | Action                                                              |
+| --------------------------------- | ------------------------------------------------------------------- |
+| Any printable character           | Append to query (fuzzy filter)                                      |
+| Digits (empty query)              | Jump to tab N. With ≥10 tabs, digits buffer up to 0.4 s.            |
+| `↑` / `Ctrl-p` / `Ctrl-k`         | Move selection up                                                   |
+| `↓` / `Tab` / `Ctrl-n` / `Ctrl-j` | Move selection down                                                 |
+| `Enter`                           | Switch to the selected tab and close                                |
+| `Backspace`                       | Delete the last character                                           |
+| `Ctrl-w`                          | Delete the previous word                                            |
+| `Ctrl-u`                          | Clear the entire query                                              |
+| `Esc` / `Ctrl-c` / `Ctrl-g`       | Close the picker without switching                                  |
 
 ## Installation
 
@@ -116,27 +116,20 @@ Optional values passed via the plugin alias. Defaults are sensible for typical t
 ```kdl
 plugins {
     tab-quicksearch location="file:~/.config/zellij/plugins/tab-quicksearch.wasm" {
-        min_cols "40"
-        max_cols "90"
-        max_cols_percent "60"
-
-        min_rows "10"
-        max_rows "22"
-        max_rows_percent "50"
+        max_cols "60"
+        max_rows "20"
     }
 }
 ```
 
-| Key                | Default | Meaning                                                       |
-| ------------------ | ------- | ------------------------------------------------------------- |
-| `min_cols`         | 40      | Minimum width of the inner box                                |
-| `max_cols`         | 90      | Hard cap on width                                             |
-| `max_cols_percent` | 60      | Width as percentage of the pane, upper-bounded by `max_cols`  |
-| `min_rows`         | 10      | Minimum height                                                |
-| `max_rows`         | 22      | Hard cap on height                                            |
-| `max_rows_percent` | 50      | Height as percentage of the pane                              |
+| Key        | Default | Meaning                          |
+| ---------- | ------- | -------------------------------- |
+| `max_cols` | 60      | Box width in cells               |
+| `max_rows` | 20      | Box height in cells              |
 
-Effective size per dimension is `clamp(avail, min_abs, min(max_abs, avail * max_percent / 100))`. Below 20 columns the picker renders blank rather than breaking the frame.
+The plugin requests the floating pane to be sized exactly to `max_cols × max_rows` via Zellij's plugin API. If the pane is briefly larger during initial layout, the inner box stays capped at those values and is centered inside the pane. Below 20 columns or 4 rows the picker renders blank rather than breaking the frame.
+
+> **Note**: Zellij 0.44 has a race condition between plugin loading and floating-pane resize requests, which causes a brief one-frame flicker on the first open: the pane is initially shown in Zellij's default size before the plugin's resize takes effect. Subsequent opens are stable.
 
 ## Development
 
@@ -171,7 +164,7 @@ zellij-tab-quicksearch/
 ├── LICENSE
 ├── README.md
 └── src/
-    └── main.rs       # single-file plugin (~820 lines)
+    └── main.rs       # single-file plugin (~1130 lines)
 ```
 
 ## License

@@ -18,12 +18,12 @@
     ,
     }:
     let
-      # Single-Source-of-Truth für Name und Version.
+      # Single source of truth for package name and version.
       cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
       pname = cargoToml.package.name;
       version = cargoToml.package.version;
 
-      # Overlay ist system-unabhängig — muss außerhalb von eachDefaultSystem stehen.
+      # Overlay is system-agnostic — must live outside eachDefaultSystem.
       overlay = final: _prev: {
         ${pname} = self.packages.${final.system}.default;
       };
@@ -33,14 +33,14 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # Stable-Rust + wasm32-wasip1 Target — das Minimum, das der Package-Build braucht.
+        # Stable Rust + wasm32-wasip1 target — the minimum the package build needs.
         buildToolchain = with fenix.packages.${system}; combine [
           stable.cargo
           stable.rustc
           targets.wasm32-wasip1.stable.rust-std
         ];
 
-        # Volle Dev-Toolchain inkl. clippy/rustfmt/rust-analyzer für die devShell.
+        # Full dev toolchain incl. clippy/rustfmt/rust-analyzer for the devShell.
         devToolchain = with fenix.packages.${system}; combine [
           stable.cargo
           stable.rustc
@@ -55,8 +55,8 @@
           rustc = buildToolchain;
         };
 
-        # Gefilterte Quelle — nur relevante Build-Inputs, keine Artefakte
-        # (`result`-Symlink, `target/`, etc.) in den Nix-Store ziehen.
+        # Filtered source — only relevant build inputs, no artefacts
+        # (`result` symlink, `target/`, etc.) pulled into the Nix store.
         src = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter = path: type:
@@ -72,13 +72,13 @@
           inherit pname version src;
           cargoLock.lockFile = ./Cargo.lock;
 
-          # Plugin ist WASM — kein nativer Binary, kein `cargo test` über Ziele.
+          # Plugin is WASM — no native binary, no `cargo test` across targets.
           doCheck = false;
 
           buildPhase = ''
             runHook preBuild
-            # --frozen impliziert --offline und --locked: kein Netzwerk,
-            # Cargo.lock darf nicht modifiziert werden → strikt reproduzierbar.
+            # --frozen implies --offline and --locked: no network access,
+            # Cargo.lock must not be modified → strictly reproducible.
             cargo build --release --target wasm32-wasip1 --frozen
             runHook postBuild
           '';
@@ -86,7 +86,7 @@
           installPhase = ''
             runHook preInstall
             mkdir -p $out/bin
-            # Kanonischer Name + kurzer Alias-Symlink (Zellij-Plugin-Namensraum).
+            # Canonical name + short alias symlink (Zellij plugin namespace).
             install -Dm644 target/wasm32-wasip1/release/${pname}.wasm \
               $out/bin/${pname}.wasm
             ln -s ${pname}.wasm $out/bin/tab-quicksearch.wasm
@@ -123,9 +123,9 @@
         devShells.default = pkgs.mkShell {
           packages = [
             devToolchain
-            pkgs.zellij # zum Testen der gebauten WASM im echten Plugin-Host
-            pkgs.wabt # wasm-objdump etc. für WASM-Inspection
-            pkgs.nixpkgs-fmt # konsistent mit flake-Formatter
+            pkgs.zellij # for testing the built WASM in a real plugin host
+            pkgs.wabt # wasm-objdump etc. for WASM inspection
+            pkgs.nixpkgs-fmt # consistent with the flake formatter
           ];
         };
       })
