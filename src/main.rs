@@ -194,8 +194,14 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 let ids = get_plugin_ids();
                 self.plugin_id = ids.plugin_id;
-                set_pane_borderless(PaneId::Plugin(ids.plugin_id), true);
                 self.ready = true;
+                // Resize + borderless straight from `Granted` so the pane
+                // reaches its target geometry one round-trip earlier than
+                // waiting for the first `PaneUpdate`. The `PaneUpdate`
+                // handler still re-issues the resize on later layout
+                // resets, so this is a one-time fast-path, not a
+                // replacement.
+                self.resize_pane();
                 true
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
@@ -241,10 +247,12 @@ impl ZellijPlugin for State {
                 true
             }
             Event::PaneUpdate(manifest) => {
-                // `PaneUpdate` is the primary source for (a) pane resize
-                // triggers and (b) `pane_focused` as one of the two
-                // visibility components. The other —
-                // `are_floating_panes_visible` — comes from `TabUpdate`.
+                // `PaneUpdate` provides `pane_focused` (one of the two
+                // visibility components — the other is
+                // `are_floating_panes_visible` from `TabUpdate`) and
+                // re-issues the resize when Zellij has reset the pane
+                // geometry (e.g. on layout swap). The initial resize is
+                // already done in `Granted` for a fast first paint.
                 if !self.ready {
                     return false;
                 }
