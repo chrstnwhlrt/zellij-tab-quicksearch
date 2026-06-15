@@ -121,6 +121,14 @@
         formatter = pkgs.nixpkgs-fmt;
 
         devShells.default = pkgs.mkShell {
+          # `cargo test` compiles the crate (and thus zellij-tile ->
+          # zellij-utils) for the host, which links OpenSSL; pkg-config locates
+          # it at build time, LD_LIBRARY_PATH lets the test binary find
+          # libssl/libcrypto at run time. The wasm build needs neither. Lets
+          # `nix develop -c cargo test` run the unit tests out of the box.
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ];
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
           packages = [
             devToolchain
             pkgs.zellij # for testing the built WASM in a real plugin host

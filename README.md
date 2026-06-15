@@ -11,11 +11,12 @@ A floating, fuzzy-matching tab picker for [Zellij](https://zellij.dev) — open 
 
 - **Fuzzy search** powered by [nucleo-matcher](https://github.com/helix-editor/nucleo) (Helix's matcher) — smart case, unicode normalization, match highlighting.
 - **Frequency-based default order** — most-frequently-jumped tabs rise to the top when the query is empty. In-memory, session-scoped.
-- **Instant jump** — pressing a digit on an empty query jumps to that tab by position. With 10+ tabs the picker buffers digits until the full position is typed or 0.4 s pass since the last keystroke.
+- **Instant jump** — pressing a digit on an empty query jumps to that tab by position. With ≥10 tabs the picker buffers digits and jumps once the position is unambiguous: the last possible digit is typed, or 0.4 s pass after the penultimate digit.
 - **Active tab as separate header** — you can't jump to the tab you're already on, so it's shown above the list, not inside it.
 - **Bell indicator** — tabs with an active bell notification get a blinking light-grey background highlight; the animation pauses automatically when you click into the pane behind the picker.
 - **Pane count per tab** — `[N]` on the right, with the picker-plugin itself subtracted from the active tab's count.
 - **Theme-adaptive colours** — picker chrome uses 16-ANSI codes so it follows your Zellij theme; the bell highlight uses 256-colour palette 250 (a soft, near-white background).
+- **Wide-character aware** — tab names with emoji or CJK characters are measured by display width ([unicode-width](https://crates.io/crates/unicode-width)), so the frame and truncation stay aligned.
 - **Frame-less** — `set_pane_borderless` removes the default Zellij frame for a clean modal look.
 - **Configurable size** — `max_cols` and `max_rows` for the floating pane, settable via the plugin alias.
 - **Query auto-clear** — fresh query on every open.
@@ -139,13 +140,14 @@ The plugin requests the floating pane to be sized exactly to `max_cols × max_ro
 nix develop
 ```
 
-Provides the pinned Rust toolchain (`fenix` stable), the `wasm32-wasip1` target, `clippy`, `rustfmt`, `rust-analyzer`, `zellij` (for integration testing), `wabt` (for WASM inspection) and `nixpkgs-fmt`.
+Provides the pinned Rust toolchain (`fenix` stable), the `wasm32-wasip1` target, `clippy`, `rustfmt`, `rust-analyzer`, `zellij` (for integration testing), `wabt` (for WASM inspection), `nixpkgs-fmt`, plus `pkg-config` + `openssl` (so the host-side `cargo test` can build `zellij-utils`).
 
 ### Common commands
 
 ```bash
 cargo build --release --target wasm32-wasip1   # build WASM
 cargo clippy --target wasm32-wasip1 --release -- -W clippy::pedantic -D warnings
+nix develop -c cargo test                      # unit tests (host build; needs the devShell's openssl/pkg-config)
 cargo fmt
 nix build           # reproducible release build
 nix flake check     # evaluate + build as CI gate
@@ -156,7 +158,7 @@ nix fmt             # format flake.nix
 
 ```
 zellij-tab-quicksearch/
-├── Cargo.toml        # crate metadata, 2 runtime dependencies
+├── Cargo.toml        # crate metadata, 3 runtime dependencies
 ├── Cargo.lock        # checked in for reproducible builds
 ├── flake.nix         # Nix package + devShell + overlay (fenix toolchain)
 ├── flake.lock
@@ -164,7 +166,7 @@ zellij-tab-quicksearch/
 ├── LICENSE
 ├── README.md
 └── src/
-    └── main.rs       # single-file plugin (~1130 lines)
+    └── main.rs       # single-file plugin + unit tests
 ```
 
 ## License

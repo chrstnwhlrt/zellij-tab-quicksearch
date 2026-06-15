@@ -6,6 +6,7 @@ use zellij_tile::prelude::*;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32String};
+use unicode_width::UnicodeWidthChar;
 
 // SGR sequences. The picker chrome uses 16-ANSI palette codes so it
 // follows the active Zellij theme; only `BELL` reaches into 256-colour
@@ -159,8 +160,15 @@ struct State {
     vis: Visibility,
     /// Access frequency via the picker (Enter / instant-jump). Most-used
     /// tab first. The active tab is filtered out before sorting and shown
-    /// as a header.
+    /// as a header. Pruned to live tabs on each `TabUpdate`.
     access_counts: BTreeMap<usize, u64>,
+    /// Last floating-pane size observed via `PaneUpdate`. Debounces resize
+    /// requests: we only re-issue `change_floating_panes_coordinates` when the
+    /// size is off-target AND changed since last seen. On a terminal smaller
+    /// than the box Zellij clamps the pane to the viewport, so it can never
+    /// reach the target — without this guard every `PaneUpdate` would fire
+    /// another doomed resize. A real layout reset still changes the size.
+    last_pane_size: Option<(usize, usize)>,
 }
 
 register_plugin!(State);
@@ -238,6 +246,11 @@ impl ZellijPlugin for State {
                         info: Rc::new(t),
                     })
                     .collect();
+                // Prune frequency counts for tabs that no longer exist so
+                // `access_counts` cannot grow unbounded over a long session of
+                // tab churn (it is keyed by `tab_id`, which dies with the tab).
+                let live: Vec<usize> = self.tabs.iter().map(|e| e.info.tab_id).collect();
+                self.access_counts.retain(|id, _| live.contains(id));
                 self.refresh_scores();
                 self.recompute_visibility();
                 // A newly arriving bell may need to start the loop even
@@ -258,24 +271,28 @@ impl ZellijPlugin for State {
                 }
                 let pid = self.plugin_id;
                 let mut pane_focused_now = false;
-                let mut needs_resize = false;
+                let mut cur_size: Option<(usize, usize)> = None;
                 'outer: for pane_infos in manifest.panes.values() {
                     for p in pane_infos {
                         if p.is_plugin && p.id == pid {
                             pane_focused_now = p.is_floating && !p.is_suppressed && p.is_focused;
-                            if p.is_floating
-                                && (p.pane_columns != self.size.cols
-                                    || p.pane_rows != self.size.rows)
-                            {
-                                needs_resize = true;
+                            if p.is_floating {
+                                cur_size = Some((p.pane_columns, p.pane_rows));
                             }
                             break 'outer;
                         }
                     }
                 }
-                if needs_resize {
-                    self.resize_pane();
+                // Debounce: only re-issue the resize when the floating pane is
+                // off-target AND its size changed since the last `PaneUpdate`.
+                // See `last_pane_size` for why (terminals smaller than the box).
+                if let Some(size) = cur_size {
+                    if size != (self.size.cols, self.size.rows) && self.last_pane_size != Some(size)
+                    {
+                        self.resize_pane();
+                    }
                 }
+                self.last_pane_size = cur_size;
                 self.vis.pane_focused = pane_focused_now;
                 self.recompute_visibility();
                 false
@@ -723,8 +740,7 @@ impl State {
         while matches!(self.query.chars().last(), Some(c) if !c.is_whitespace()) {
             self.query.pop();
         }
-        self.selected = 0;
-        self.refresh_scores();
+        self.query_changed();
     }
 
     /// Checks whether `c` is the next digit of an in-progress quickjump
@@ -1032,30 +1048,47 @@ fn render_row(
 
 /// Writes the (possibly truncated) tab name directly into `out`, with
 /// match highlighting at every position in `indices` (must be sorted
-/// ascending). Returns the number of visible chars written.
-fn push_truncated_name(out: &mut String, name: &str, indices: &[u32], max_chars: usize) -> usize {
-    if max_chars == 0 {
+/// ascending). Truncation and the return value are measured in display
+/// cells (UAX #11), not codepoints, so wide chars (emoji, CJK) do not
+/// break frame alignment. Returns the number of visible cells written.
+fn push_truncated_name(out: &mut String, name: &str, indices: &[u32], max_cells: usize) -> usize {
+    if max_cells == 0 {
         return 0;
     }
-    let total = name.chars().count();
-    let (take, tail) = if total <= max_chars {
-        (total, false)
-    } else if max_chars <= 1 {
+    // `sanitize_char` maps control chars to '?' (width 1) before display, so
+    // measure the sanitized width to match what is actually written.
+    let total: usize = name.chars().map(|c| char_cells(sanitize_char(c))).sum();
+    if total <= max_cells {
+        return push_name_chars(out, name, indices, max_cells);
+    }
+    if max_cells == 1 {
         out.push('…');
         return 1;
-    } else {
-        (max_chars - 1, true)
-    };
+    }
+    // Reserve one cell for the trailing ellipsis.
+    let written = push_name_chars(out, name, indices, max_cells - 1);
+    out.push('…');
+    written + 1
+}
 
+/// Writes name chars (sanitized, with match highlight at `indices`) until the
+/// next char would exceed `budget` display cells. Returns cells written.
+fn push_name_chars(out: &mut String, name: &str, indices: &[u32], budget: usize) -> usize {
+    let mut used = 0usize;
     let mut idx_iter = indices.iter().peekable();
-    for (i, c) in name.chars().take(take).enumerate() {
-        // Name length <= max_chars <= cols (realistically small). Should
-        // a tab name nevertheless exceed u32::MAX chars, we silently
-        // break out — better than silent truncation via `as u32`.
+    for (i, c) in name.chars().enumerate() {
+        // Indices come from nucleo as codepoint positions, so `i` is the
+        // codepoint index. Should a name exceed u32::MAX chars we break out
+        // rather than truncate silently via `as u32`.
         let Ok(i_u32) = u32::try_from(i) else { break };
-        // Strip control chars / ANSI escapes from tab names so they
-        // cannot break our SGR state.
+        // Strip control chars / ANSI escapes so they cannot break our SGR
+        // state, then measure the resulting glyph's width.
         let c = sanitize_char(c);
+        let w = char_cells(c);
+        if used + w > budget {
+            break;
+        }
+        used += w;
         if idx_iter.peek().is_some_and(|&&v| v == i_u32) {
             idx_iter.next();
             out.push_str(MATCH);
@@ -1065,12 +1098,13 @@ fn push_truncated_name(out: &mut String, name: &str, indices: &[u32], max_chars:
             out.push(c);
         }
     }
-    if tail {
-        out.push('…');
-        take + 1
-    } else {
-        take
-    }
+    used
+}
+
+/// Display width of a single char in terminal cells (UAX #11). Width-`None`
+/// chars (controls) are treated as 0; callers sanitize controls beforehand.
+fn char_cells(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
 /// Replaces control chars (incl. ESC) with '?' — prevents SGR/cursor
@@ -1098,29 +1132,31 @@ fn digit_count(n: usize) -> usize {
     }
 }
 
-/// Returns the tail of the query when it is too long for the display
-/// budget. While typing, the cursor is at the end — that is what the
-/// user wants to see.
-fn query_tail(query: &str, max_chars: usize) -> &str {
-    if max_chars == 0 {
+/// Returns the tail of the query that fits in `max_cells` display cells.
+/// While typing, the cursor is at the end — that is what the user wants to
+/// see — so we keep the most recent characters. Measured in cells (UAX #11)
+/// so wide chars in a pasted query do not overrun the prompt row.
+fn query_tail(query: &str, max_cells: usize) -> &str {
+    if max_cells == 0 {
         return "";
     }
-    let total = query.chars().count();
-    if total <= max_chars {
-        return query;
+    let mut width = 0usize;
+    let mut start = query.len();
+    for (idx, c) in query.char_indices().rev() {
+        let w = char_cells(c);
+        if width + w > max_cells {
+            break;
+        }
+        width += w;
+        start = idx;
     }
-    let skip = total - max_chars;
-    let byte_idx = query
-        .char_indices()
-        .nth(skip)
-        .map_or(query.len(), |(i, _)| i);
-    &query[byte_idx..]
+    &query[start..]
 }
 
 /// Counts visible cells in `s`, skipping CSI escape sequences. Each
-/// non-escape codepoint is counted as one cell — wide chars (emojis, CJK)
-/// are undercounted, so callers must avoid them in framed content where
-/// padding correctness depends on the result.
+/// non-escape codepoint contributes its Unicode display width (UAX #11):
+/// wide chars (emoji, CJK) count as 2, combining marks as 0. This keeps
+/// frame padding aligned even when tab names contain such characters.
 fn visible_len(s: &str) -> usize {
     let mut len = 0usize;
     let mut in_esc = false;
@@ -1135,7 +1171,138 @@ fn visible_len(s: &str) -> usize {
             }
             continue;
         }
-        len += 1;
+        len += UnicodeWidthChar::width(ch).unwrap_or(0);
     }
     len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digit_count_boundaries() {
+        assert_eq!(digit_count(0), 1);
+        assert_eq!(digit_count(9), 1);
+        assert_eq!(digit_count(10), 2);
+        assert_eq!(digit_count(99), 2);
+        assert_eq!(digit_count(100), 3);
+        assert_eq!(digit_count(1000), 4);
+    }
+
+    #[test]
+    fn pending_jump_buffer_rules() {
+        assert!(!is_pending_jump_buffer("")); // empty
+        assert!(!is_pending_jump_buffer("0")); // leading zero
+        assert!(!is_pending_jump_buffer("01"));
+        assert!(!is_pending_jump_buffer("1a")); // non-digit
+        assert!(!is_pending_jump_buffer("abc"));
+        assert!(is_pending_jump_buffer("1"));
+        assert!(is_pending_jump_buffer("12"));
+        assert!(is_pending_jump_buffer("905"));
+    }
+
+    #[test]
+    fn char_cells_widths() {
+        assert_eq!(char_cells('a'), 1);
+        assert_eq!(char_cells('世'), 2); // CJK wide
+        assert_eq!(char_cells('❯'), 1); // prompt glyph — build_prompt assumes 1
+        assert_eq!(char_cells('…'), 1); // ellipsis
+        assert_eq!(char_cells('│'), 1); // box drawing
+    }
+
+    #[test]
+    fn visible_len_skips_escapes_and_counts_width() {
+        assert_eq!(visible_len("abc"), 3);
+        assert_eq!(visible_len("\u{1b}[1;33mX\u{1b}[0m"), 1); // SGR is zero-width
+        assert_eq!(visible_len("世界"), 4); // two CJK = four cells
+        assert_eq!(visible_len("a世"), 3);
+    }
+
+    #[test]
+    fn query_tail_keeps_end_by_width() {
+        assert_eq!(query_tail("hello", 0), "");
+        assert_eq!(query_tail("hello", 10), "hello"); // fits whole
+        assert_eq!(query_tail("hello", 3), "llo"); // most recent chars
+        assert_eq!(query_tail("世界", 4), "世界");
+        assert_eq!(query_tail("世界", 3), "界"); // only the last wide char fits
+        assert_eq!(query_tail("世界", 1), ""); // a 2-wide char cannot fit in 1
+    }
+
+    #[test]
+    fn sanitize_replaces_controls() {
+        assert_eq!(sanitize_char('a'), 'a');
+        assert_eq!(sanitize_char('世'), '世');
+        assert_eq!(sanitize_char('\u{1b}'), '?'); // ESC
+        assert_eq!(sanitize_char('\n'), '?');
+    }
+
+    #[test]
+    fn truncated_name_fits_returns_width() {
+        let mut s = String::new();
+        let w = push_truncated_name(&mut s, "abc", &[], 10);
+        assert_eq!(s, "abc");
+        assert_eq!(w, 3);
+    }
+
+    #[test]
+    fn truncated_name_adds_ellipsis() {
+        let mut s = String::new();
+        let w = push_truncated_name(&mut s, "abcdef", &[], 4);
+        assert_eq!(s, "abc…");
+        assert_eq!(w, 4);
+    }
+
+    #[test]
+    fn truncated_name_wide_chars_respect_cells() {
+        // "世界世" = 6 cells; budget 5 reserves 1 for '…', fits 4 cells of name.
+        let mut s = String::new();
+        let w = push_truncated_name(&mut s, "世界世", &[], 5);
+        assert_eq!(s, "世界…");
+        assert_eq!(w, 5);
+    }
+
+    #[test]
+    fn truncated_name_wide_char_partial_cell() {
+        // Budget 4 → content budget 3, next char is 2-wide → only "世" fits.
+        let mut s = String::new();
+        let w = push_truncated_name(&mut s, "世界世", &[], 4);
+        assert_eq!(s, "世…");
+        assert_eq!(w, 3);
+    }
+
+    #[test]
+    fn truncated_name_single_cell_is_ellipsis() {
+        let mut s = String::new();
+        let w = push_truncated_name(&mut s, "abc", &[], 1);
+        assert_eq!(s, "…");
+        assert_eq!(w, 1);
+    }
+
+    #[test]
+    fn truncated_name_zero_budget_writes_nothing() {
+        let mut s = String::new();
+        let w = push_truncated_name(&mut s, "abc", &[], 0);
+        assert_eq!(s, "");
+        assert_eq!(w, 0);
+    }
+
+    #[test]
+    fn truncated_name_highlights_indices() {
+        let mut s = String::new();
+        let w = push_truncated_name(&mut s, "abc", &[1], 10);
+        assert_eq!(s, format!("a{MATCH}b{RESET}c")); // escapes are zero-width
+        assert_eq!(w, 3);
+    }
+
+    #[test]
+    fn pad_and_push_pad() {
+        assert_eq!(pad(3), "   ");
+        assert_eq!(pad(0), "");
+        // pad() is capped at PAD_SPACES length; push_pad must loop past it.
+        let mut s = String::new();
+        push_pad(&mut s, 300);
+        assert_eq!(s.len(), 300);
+        assert!(s.bytes().all(|b| b == b' '));
+    }
 }
