@@ -162,13 +162,6 @@ struct State {
     /// tab first. The active tab is filtered out before sorting and shown
     /// as a header. Pruned to live tabs on each `TabUpdate`.
     access_counts: BTreeMap<usize, u64>,
-    /// Last floating-pane size observed via `PaneUpdate`. Debounces resize
-    /// requests: we only re-issue `change_floating_panes_coordinates` when the
-    /// size is off-target AND changed since last seen. On a terminal smaller
-    /// than the box Zellij clamps the pane to the viewport, so it can never
-    /// reach the target — without this guard every `PaneUpdate` would fire
-    /// another doomed resize. A real layout reset still changes the size.
-    last_pane_size: Option<(usize, usize)>,
 }
 
 register_plugin!(State);
@@ -271,28 +264,38 @@ impl ZellijPlugin for State {
                 }
                 let pid = self.plugin_id;
                 let mut pane_focused_now = false;
-                let mut cur_size: Option<(usize, usize)> = None;
+                let mut oversized = false;
                 'outer: for pane_infos in manifest.panes.values() {
                     for p in pane_infos {
                         if p.is_plugin && p.id == pid {
                             pane_focused_now = p.is_floating && !p.is_suppressed && p.is_focused;
-                            if p.is_floating {
-                                cur_size = Some((p.pane_columns, p.pane_rows));
+                            // Re-assert the target size only when the pane is
+                            // LARGER than target. A floating-pane resize never
+                            // emits a `PaneUpdate` (in Zellij 0.44.3 it only
+                            // schedules a repaint; `PaneUpdate` fires solely on
+                            // structural changes / bell), so re-asserting can
+                            // never feed back into a resize storm. "Larger than
+                            // target" is the one off-target case that is
+                            // provably reachable — viewport >= pane > target —
+                            // so the request wins Zellij's load/relayout race
+                            // and the check then goes quiet: self-terminating,
+                            // zero steady-state cost. A *smaller* pane is a
+                            // viewport clamp on a narrow terminal; we leave it
+                            // alone (render caps the box to the pane) rather
+                            // than firing resizes that can never succeed.
+                            if p.is_floating
+                                && (p.pane_columns > self.size.cols
+                                    || p.pane_rows > self.size.rows)
+                            {
+                                oversized = true;
                             }
                             break 'outer;
                         }
                     }
                 }
-                // Debounce: only re-issue the resize when the floating pane is
-                // off-target AND its size changed since the last `PaneUpdate`.
-                // See `last_pane_size` for why (terminals smaller than the box).
-                if let Some(size) = cur_size {
-                    if size != (self.size.cols, self.size.rows) && self.last_pane_size != Some(size)
-                    {
-                        self.resize_pane();
-                    }
+                if oversized {
+                    self.resize_pane();
                 }
-                self.last_pane_size = cur_size;
                 self.vis.pane_focused = pane_focused_now;
                 self.recompute_visibility();
                 false
