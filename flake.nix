@@ -96,7 +96,8 @@
           meta = with pkgs.lib; {
             description = cargoToml.package.description or "Zellij fuzzy tab picker";
             longDescription = ''
-              A Zellij plugin providing a floating, fuzzy-matching tab picker.
+              A Zellij plugin providing a floating, fuzzy-matching, typo-tolerant
+              tab picker.
               Features frequency-based ordering, instant jump via digit keys,
               theme-aware rendering, and graceful behaviour on narrow panes.
             '';

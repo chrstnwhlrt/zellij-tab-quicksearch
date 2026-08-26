@@ -8,7 +8,7 @@ authors = ["Christian Wohlert <christian667@gmail.com>"]
 readme = "README.md"
 
 [dependencies]
-zellij-tile = "0.44.3"
+zellij-tile = "0.45.0"
 nucleo-matcher = "0.3.1"
 unicode-width = "0.2.2"
 
