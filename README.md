@@ -111,13 +111,18 @@ The attention markers and the blinking rely on Zellij's `attention` settings, wh
 
 ### Reload after rebuilding
 
-Existing Zellij sessions cache the loaded plugin. After rebuilding:
+A running session keeps the plugin it has loaded, and `Esc` only hides the picker. To switch a session to a new build, close every picker instance, then open the picker once while bypassing Zellij's plugin cache. Run this from inside the session; it needs `jq`:
 
 ```bash
-zellij action start-or-reload-plugin file:~/.config/zellij/plugins/tab-quicksearch.wasm
+zellij action list-panes --json |
+  jq -r '.[] | select(.plugin_url // "" | contains("tab-quicksearch")) | "zellij action close-pane --pane-id plugin_\(.id)"' |
+  sh
+zellij action launch-or-focus-plugin --skip-plugin-cache --floating --move-to-focused-tab tab-quicksearch
 ```
 
-Run it from inside the session (or pass `--session <name>`) while a client is attached: Zellij 0.44 to 0.46 refuses to reload without one (`No connected clients, cannot reload plugin` in the log) and, worse, has already marked the plugin as pending at that point, so the running instance stops reacting until a later reload succeeds or the session restarts.
+The picker opens with the new build, and from then on the keybinding finds this instance. The frequency counts start over. Without `--skip-plugin-cache` Zellij would start the old build again, because it keeps the compiled plugin in memory after the last instance is closed. The snippet runs unchanged in POSIX shells and in nushell.
+
+Do not use `zellij action start-or-reload-plugin` for this. It does not always find the picker the keybinding opened, and then starts a second, tiled picker next to it.
 
 ## Plugin-side configuration
 
