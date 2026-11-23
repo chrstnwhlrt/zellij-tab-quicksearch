@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write;
 use std::rc::Rc;
 use zellij_tile::prelude::*;
@@ -8,9 +9,9 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32String};
 use unicode_width::UnicodeWidthChar;
 
-// SGR sequences. The picker chrome uses 16-ANSI palette codes so it
-// follows the active Zellij theme; only `BELL` reaches into 256-colour
-// for a soft, theme-neutral light-grey background.
+// SGR sequences. The picker chrome uses the 16 ANSI palette colours so it
+// follows the active Zellij theme; only `ALERT` reaches into the 256-colour
+// palette for a soft, theme-neutral light-grey background.
 const RESET: &str = "\u{1b}[0m";
 const DIM: &str = "\u{1b}[2m";
 const REVERSE: &str = "\u{1b}[7m";
@@ -19,14 +20,16 @@ const MATCH: &str = "\u{1b}[1;33m"; // bold yellow
 const FRAME: &str = "\u{1b}[2m";
 const ACTIVE: &str = "\u{1b}[1;36m"; // bold cyan
 const SELECTED: &str = "\u{1b}[1;7m"; // bold + reverse — selection highlight
+const BOLD: &str = "\u{1b}[1m";
 
-// Bell: reverse flag + light-grey fg → the swap makes fg = default-bg
-// (same fg as selection) and bg = light grey (palette 250, near white).
-const BELL: &str = "\u{1b}[7;38;5;250m";
-// Re-establishes `BELL` after a `MATCH` run inside a bell row. A bare
+// Alert background for rows whose tab calls for you (see `calls_for_you`):
+// reverse flag plus light-grey fg, so the swap makes fg the default bg (same
+// fg as the selection) and bg light grey (palette 250, near white).
+const ALERT: &str = "\u{1b}[7;38;5;250m";
+// Re-establishes `ALERT` after a `MATCH` run inside an alert row. A bare
 // `RESET` there would drop the row background for everything after the
-// first highlighted char; `0` resets, then the bell attributes re-apply.
-const BELL_RESTORE: &str = "\u{1b}[0;7;38;5;250m";
+// first highlighted char; `0` resets, then the alert attributes re-apply.
+const ALERT_RESTORE: &str = "\u{1b}[0;7;38;5;250m";
 
 // Static padding to avoid `" ".repeat(n)` allocations in hot paths.
 const PAD_SPACES: &str = "                                                                                                                                ";
@@ -45,8 +48,8 @@ fn push_pad(out: &mut String, n: usize) {
     }
 }
 
-// Hard upper bound for the query — prevents layout overflow on paste of
-// huge strings and preserves prompt-row integrity.
+// Hard upper bound for the query — prevents layout overflow when huge
+// strings are pasted and preserves prompt-row integrity.
 const MAX_QUERY_CHARS: usize = 128;
 
 // Smallest box the frame layout can render (frame + minimal content).
@@ -55,7 +58,8 @@ const MAX_QUERY_CHARS: usize = 128;
 const MIN_BOX_COLS: usize = 20;
 const MIN_BOX_ROWS: usize = 4;
 
-// Blink interval for the bell background (toggle per tick).
+// Blink interval for the alert background of the rows that call for you
+// (toggle per tick).
 const BLINK_INTERVAL: f64 = 0.5;
 
 // Time after the (D-1)-th digit before a quickjump fires on the buffered
@@ -65,12 +69,13 @@ const BLINK_INTERVAL: f64 = 0.5;
 const JUMP_TIMEOUT: f64 = 0.4;
 
 // Tolerance when attributing a `Timer(elapsed)` event to the requested
-// duration of a pending timer: covers float rounding only, the host never
+// duration of a pending timer: covers float rounding only; the host never
 // fires a timer early.
 const TIMER_SLACK: f64 = 0.01;
 
-// Upper bound for the timer bookkeeping queue. Only reachable if the host
-// ever drops a `Timer` event; the oldest entry is then assumed lost.
+// Upper bound for the timer bookkeeping queue. Reached only if the host
+// drops `Timer` events or a burst of superseded jump timers outruns their
+// timeout; the evicted entry is then assumed lost (see `Timers::armed`).
 const MAX_PENDING_TIMERS: usize = 8;
 
 // Characters with a special meaning in nucleo's query syntax (`!` negation,
@@ -81,6 +86,11 @@ const NUCLEO_OPERATORS: &str = "!^$'\\";
 
 // Tab names longer than this skip the typo-tolerant pass (O(query × name)).
 const APPROX_MAX_NAME_CHARS: usize = 512;
+
+// Upper bound for geometry re-asserts between two observations of the pane
+// at its target size (or a reopen), see `State::take_reassert`. Three
+// covers the load/relayout race with room to spare.
+const MAX_GEOMETRY_REASSERTS: u8 = 3;
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -100,8 +110,8 @@ struct TabEntry {
 /// above every approximate (typo-tolerant) one, see `rank`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MatchKind {
-    /// No query: the unfiltered list, ordered by access frequency (see
-    /// `State::list_by_frequency`), never by `rank`.
+    /// No query: the unfiltered list, tabs that call for you first, then by
+    /// access frequency (see `State::list_by_frequency`), never by `rank`.
     Listed,
     /// nucleo fuzzy match with its score (higher is better).
     Fuzzy(u32),
@@ -127,9 +137,90 @@ struct Scored {
     indices: Vec<u32>,
 }
 
+/// Attention marker of a tab, following Zellij's own tab bar
+/// (`default-plugins/bars/src/tab_marker.rs`, 0.46): a muted tab shows a
+/// dim `⊘`; otherwise a tab shows its counted status (needs you, failed,
+/// done, working) and failing that a pending or flashing bell, which counts
+/// as "needs you". Quiet and new output never mark a tab. Hosts before 0.46
+/// send no attention state, so there only the bell can mark a tab; with
+/// `attention.tab_markers` (or `enabled`) off, 0.46 still reports whether a
+/// tab is muted, but no status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Marker {
+    Muted,
+    Status(AttentionStatus),
+}
+
+impl Marker {
+    fn for_tab(tab: &TabInfo) -> Option<Marker> {
+        if tab.attention.muted {
+            Some(Marker::Muted)
+        } else if tab.attention.status.is_counted() {
+            Some(Marker::Status(tab.attention.status))
+        } else if tab.has_bell_notification || tab.is_flashing_bell {
+            Some(Marker::Status(AttentionStatus::NeedsYou))
+        } else {
+            None
+        }
+    }
+
+    /// The glyph Zellij's tab bar uses. Every one is a single cell wide.
+    fn symbol(self) -> &'static str {
+        match self {
+            Marker::Muted => "⊘",
+            Marker::Status(status) => status.symbol(),
+        }
+    }
+
+    /// SGR for the glyph in a plain row: dim when muted, bold when urgent
+    /// (needs you, failed), otherwise the row's text colour.
+    fn style(self) -> &'static str {
+        match self {
+            Marker::Muted => DIM,
+            Marker::Status(AttentionStatus::NeedsYou | AttentionStatus::Failed) => BOLD,
+            Marker::Status(_) => "",
+        }
+    }
+}
+
+/// True when `pane` calls for you (Zellij 0.46+): a program that reports
+/// its state to Zellij (OSC 7501, as Claude Code does) waits for your
+/// approval, an answer or a login, or has finished or failed; or the pane
+/// sent a desktop notification, or a watch set on it fired. Zellij drops a
+/// finished or failed state, a notification and a fired watch once you have
+/// seen the pane, so these call only until you look. A bell calls only from
+/// the pane of such a program: Zellij ranks a bell above a finished or
+/// failed report, so an agent that rings while it waits for input would
+/// otherwise stop calling. Any other bell, a finished shell command and a
+/// muted pane never call, and hosts before 0.46 report no pane state at all.
+fn pane_calls_for_you(pane: &PaneInfo) -> bool {
+    use AttentionSource::{Bell, Notification, ProgramStatus, Watch};
+    use AttentionStatus::{Done, Failed, NeedsYou};
+    let attention = &pane.attention;
+    let from_program = match attention.source {
+        Some(ProgramStatus | Notification | Watch) => true,
+        Some(Bell) => !pane.program_status.is_empty(),
+        _ => false,
+    };
+    from_program
+        && matches!(attention.status, NeedsYou | Done | Failed)
+        && attention.muted.is_none()
+}
+
+/// True when `tab` calls for you: one of its panes does (`calling` holds the
+/// positions of such tabs from the last `PaneUpdate`, see
+/// `pane_calls_for_you`), and the tab is unmuted with a counted status,
+/// which its marker shows. Such a row blinks and leads the list on an empty
+/// query. The status condition keeps a row from blinking without a visible
+/// reason when `attention.tab_markers` is off: Zellij then still reports the
+/// panes' states, but no tab status.
+fn calls_for_you(calling: &BTreeSet<usize>, tab: &TabInfo) -> bool {
+    tab.attention.status.is_counted() && !tab.attention.muted && calling.contains(&tab.position)
+}
+
 /// Configured box dimensions in cells. Sent both as the pane request size
 /// to `change_floating_panes_coordinates` and used as the render-box cap:
-/// the plugin box is `min(render_area, size)`, centered inside the pane.
+/// the plugin box is `min(render_area, size)`, centred inside the pane.
 struct SizeCfg {
     cols: usize,
     rows: usize,
@@ -166,22 +257,25 @@ impl SizeCfg {
 ///   when the user clicks into the tile below without changing
 ///   `pane_focused` — so `pane_focused` alone is not sufficient.
 /// - `host_visible` (`Event::Visible`): the host's own last word, if it
-///   gave one. Zellij 0.44.x/0.45.0 never send it to floating panes; the
-///   fix on Zellij's main branch (after 0.45.0) sends `false` when the
-///   plugin's tab is switched away, the floating layer is hidden or the
-///   client detaches, and `true` on return. Neither version sends it for
-///   `hide_self`/reopen. Cleared by every `TabUpdate`/`PaneUpdate`, which
-///   only reach a plugin whose tab is the active one — so a missing
-///   `Visible(true)` (e.g. after the pane moved to another tab) can never
-///   leave the picker stuck invisible.
+///   gave one. Zellij 0.44.x and 0.45.0 never send it to floating panes;
+///   from 0.45.1 it arrives as `false` when the plugin's tab is switched
+///   away, the floating layer is hidden or the client detaches, and as
+///   `true` on return. 0.46 also sends it for `hide_self` and the reopen,
+///   where `hide()` and the rising edge of `pane_focused` already decide.
+///   Cleared by every `TabUpdate`/`PaneUpdate`, which only reach a plugin
+///   whose tab is the active one, so a missing `Visible(true)` (e.g. after
+///   the pane moved to another tab) can never leave the picker stuck
+///   invisible.
 ///
-/// Known limitation: a hidden plugin (`hide_self`) receives no
-/// `TabUpdate`/`PaneUpdate` at all — Zellij targets only the tiled and
-/// floating panes of the active tab. `hide()` therefore resets these flags
-/// locally, and the reopen is detected as the rising edge of
-/// `pane_focused` in `PaneUpdate`. Without `Visible` events the blink loop
-/// keeps running invisibly after a tab switch (not perceivable,
-/// CPU-irrelevant) and terminates on return via `TabUpdate`.
+/// Hidden plugins: before Zellij 0.46 a plugin hidden with `hide_self`
+/// receives no `TabUpdate`/`PaneUpdate` at all, because Zellij targets only
+/// the tiled and floating panes of the active tab; from 0.46 it keeps
+/// receiving them while its tab is active, with its own pane reported as
+/// suppressed. Either way `hide()` resets these flags locally and the
+/// reopen is detected as the rising edge of `pane_focused` in `PaneUpdate`.
+/// Without `Visible` events (before 0.45.1) the blink loop keeps running
+/// invisibly after a tab switch (not perceivable, CPU-irrelevant) until the
+/// `TabUpdate` on return re-evaluates it.
 #[derive(Default)]
 struct Visibility {
     visible: bool,
@@ -214,7 +308,8 @@ struct ListArea {
 /// its own bookkeeping to tell the two timer sources apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimerKind {
-    /// Bell-blink tick. At most one is ever in flight.
+    /// Blink tick for the rows that call for you. At most one is ever in
+    /// flight.
     Blink,
     /// Quickjump timeout. Only the newest generation may act.
     Jump { generation: u32 },
@@ -222,8 +317,9 @@ enum TimerKind {
 
 #[derive(Default)]
 struct Timers {
-    /// Toggles per blink tick — drives the bell-row background colour.
-    bell_blink_on: bool,
+    /// Toggles per blink tick: drives the background of the rows that call
+    /// for you.
+    blink_on: bool,
     /// In-flight host timers, oldest first, with their requested duration.
     pending: VecDeque<(TimerKind, f64)>,
     /// Bumped by every new jump timer and by `State::hide`; a `Jump` entry
@@ -283,11 +379,16 @@ struct State {
     tabs_received: bool,
     query: String,
     selected: usize,
+    /// True once the user moved the selection in this open cycle (keys,
+    /// wheel, click). Such a selection stays on its tab when an update
+    /// reorders the list; the initial one stays on the first row.
+    selection_moved: bool,
     scroll_offset: usize,
     matcher: Matcher,
     scored: Vec<Scored>,
     size: SizeCfg,
-    /// True after `PermissionStatus::Granted` — gates Key/PaneUpdate handling.
+    /// True after `PermissionStatus::Granted` — gates key, mouse and
+    /// `PaneUpdate` handling and the render.
     ready: bool,
     /// Plugin's own pane id, captured in `Granted` from `get_plugin_ids()`.
     /// Needed for `change_floating_panes_coordinates` and `set_pane_borderless`.
@@ -296,10 +397,17 @@ struct State {
     vis: Visibility,
     /// List geometry of the last render, for mouse hit-testing.
     list_area: Option<ListArea>,
+    /// Geometry re-asserts since the pane was last seen at its target size
+    /// or reopened; capped at `MAX_GEOMETRY_REASSERTS` (see `take_reassert`).
+    geometry_reasserts: u8,
     /// Access frequency via the picker (Enter / instant-jump / click).
-    /// Most-used tab first. The active tab is filtered out before sorting
-    /// and shown as a header. Pruned to live tabs on each `TabUpdate`.
+    /// Orders the empty-query list after the tabs that call for you,
+    /// most-used first. The active tab is filtered out before sorting and
+    /// shown as a header. Pruned to live tabs on each `TabUpdate`.
     access_counts: BTreeMap<usize, u64>,
+    /// Positions of the tabs with a pane that calls for you, from the last
+    /// `PaneUpdate` (see `calls_for_you`).
+    calling: BTreeSet<usize>,
 }
 
 register_plugin!(State);
@@ -313,13 +421,15 @@ impl ZellijPlugin for State {
         subscribe(&[
             EventType::PermissionRequestResult,
             EventType::TabUpdate,
-            // `PaneUpdate`: geometry re-assert (reopen, layout resets), plus
-            // the `pane_focused` visibility indicator (see `Visibility`).
+            // `PaneUpdate`: geometry re-assert (reopen, layout resets), the
+            // `pane_focused` visibility indicator (see `Visibility`) and the
+            // tabs that call for you (see `pane_calls_for_you`).
             EventType::PaneUpdate,
             EventType::Key,
             // `Mouse`: click to select / confirm, wheel to move the selection.
             EventType::Mouse,
-            // `Timer`: quickjump buffer + bell-blink loop.
+            // `Timer`: quickjump buffer + blink loop of the rows that call
+            // for you.
             EventType::Timer,
             // `Visible`: the host's visibility signal, where it sends one.
             EventType::Visible,
@@ -379,42 +489,7 @@ impl ZellijPlugin for State {
     fn render(&mut self, rows: usize, cols: usize) {
         // One string buffer, one print! → one syscall instead of ~30.
         let mut out = String::with_capacity(rows * (cols + 8));
-
-        if !self.ready {
-            self.list_area = None;
-            for _ in 0..rows {
-                append_padded(&mut out, cols, "");
-            }
-            if out.ends_with('\n') {
-                out.pop();
-            }
-            print!("{out}");
-            return;
-        }
-
-        // Box capped at the configured size, centered in the plugin area.
-        // When `change_floating_panes_coordinates` has taken effect the
-        // render area equals the box → no padding. Otherwise (the frame
-        // between (re)open and the resize taking effect) the box is
-        // rendered compact with padding around it — cosmetically imperfect
-        // but stable.
-        let place = BoxPlacement::centered(rows, cols, &self.size);
-        for _ in 0..place.vpad_top {
-            append_padded(&mut out, cols, "");
-        }
-        self.render_box(&mut out, place);
-        for _ in 0..place.vpad_bottom(rows) {
-            append_padded(&mut out, cols, "");
-        }
-
-        // Drop the trailing `\n`: otherwise the plugin writes rows × `\n`,
-        // which moves the cursor to row[rows] (outside the plugin area)
-        // after the last line and causes vte to scroll the grid up by one
-        // row — the top line (`╭───╮`) disappears.
-        if out.ends_with('\n') {
-            out.pop();
-        }
-
+        self.draw(&mut out, rows, cols);
         print!("{out}");
     }
 }
@@ -427,32 +502,32 @@ fn append_padded(out: &mut String, cols: usize, content: &str) {
     out.push('\n');
 }
 
-/// Per-row highlight context. Bundled so rendering helpers stay under
-/// the argument-count limit and to prevent flag-swap bugs at call sites.
+/// Per-row highlight context. Bundled so that rendering helpers stay under
+/// the argument-count limit and call sites cannot swap the flags.
 #[derive(Clone, Copy, Default)]
 struct HighlightStyle {
     /// This row is the picker's selection.
     selected: bool,
-    /// This row's tab has a pending bell notification.
-    bell: bool,
-    /// Current blink tick state (only relevant when `bell`).
+    /// This row's tab calls for you (see `calls_for_you`), so it blinks.
+    alert: bool,
+    /// Current blink tick state (only relevant when `alert`).
     blink_on: bool,
 }
 
 /// Writes a framed line with conditional outer highlight.
 /// Logic:
-/// - Bell off (`bell && !blink_on`): no highlight (selection blinks out,
-///   bell bg off). Plain text.
-/// - Otherwise: selected dominates (`REVERSE`), else bell bg, else none.
+/// - Alert off (`alert && !blink_on`): no highlight (selection blinks
+///   out, alert bg off). Plain text.
+/// - Otherwise: selected dominates (`SELECTED`), else alert bg, else none.
 fn append_wrap(out: &mut String, content: &str, content_width: usize, style: HighlightStyle) {
     let vis = visible_len(content);
     let gap = content_width.saturating_sub(vis);
-    let lit = if style.bell { style.blink_on } else { true };
+    let lit = !style.alert || style.blink_on;
     let outer: &str = if lit {
         if style.selected {
             SELECTED
-        } else if style.bell {
-            BELL
+        } else if style.alert {
+            ALERT
         } else {
             ""
         }
@@ -566,6 +641,40 @@ impl RowFrame {
 }
 
 impl State {
+    /// Draws the whole pane into `out` as `render` prints it: `rows` lines of
+    /// exactly `cols` cells, blank until the permission is granted, with no
+    /// newline after the last line.
+    fn draw(&mut self, out: &mut String, rows: usize, cols: usize) {
+        if self.ready {
+            // Box capped at the configured size, centred in the plugin area.
+            // When `change_floating_panes_coordinates` has taken effect the
+            // render area equals the box → no padding. Otherwise (the frame
+            // between (re)open and the resize taking effect) the box is
+            // rendered compact with padding around it — cosmetically
+            // imperfect but stable.
+            let place = BoxPlacement::centered(rows, cols, &self.size);
+            for _ in 0..place.vpad_top {
+                append_padded(out, cols, "");
+            }
+            self.render_box(out, place);
+            for _ in 0..place.vpad_bottom(rows) {
+                append_padded(out, cols, "");
+            }
+        } else {
+            self.list_area = None;
+            for _ in 0..rows {
+                append_padded(out, cols, "");
+            }
+        }
+        // Drop the trailing `\n`: otherwise the plugin writes rows × `\n`,
+        // which moves the cursor to row[rows] (outside the plugin area)
+        // after the last line and causes vte to scroll the grid up by one
+        // row — the top line (`╭───╮`) disappears.
+        if out.ends_with('\n') {
+            out.pop();
+        }
+    }
+
     fn build_prompt(&self, content: &mut String, content_width: usize) {
         // Layout: "❯ " + query + cursor block. Padding to the box edge is
         // handled by append_wrap; `query_tail` keeps the most recent chars
@@ -594,10 +703,12 @@ impl State {
         let content_width = frame.content_width();
         if self.scored.is_empty() {
             // Before the first `TabUpdate` the list is merely unknown, not
-            // empty — render blank rows instead of a misleading message.
-            let msg = match (self.tabs_received, self.tabs.is_empty()) {
+            // empty — render blank rows instead of a misleading message. An
+            // empty query lists every tab but the active one (the header),
+            // so an empty list there means the session has no other tab.
+            let msg = match (self.tabs_received, self.query.is_empty()) {
                 (false, _) => "",
-                (true, true) => "no tabs",
+                (true, true) => "no other tabs",
                 (true, false) => "no matches",
             };
             let lpad = content_width.saturating_sub(msg.len()) / 2;
@@ -622,20 +733,20 @@ impl State {
         }
 
         let pos_width = digit_count(self.tabs.len());
-        let blink_on = self.timers.bell_blink_on;
+        let blink_on = self.timers.blink_on;
         for row in 0..list_rows {
             let idx = self.scroll_offset + row;
             content.clear();
             // Single lookup, then derive both row content and outer style.
             // Indices past `scored.len()` simply render as empty rows.
             let style = if let Some(s) = self.scored.get(idx) {
-                let is_sel = idx == self.selected;
-                render_row(content, s, is_sel, content_width, pos_width, blink_on);
-                HighlightStyle {
-                    selected: is_sel,
-                    bell: s.tab.has_bell_notification,
+                let style = HighlightStyle {
+                    selected: idx == self.selected,
+                    alert: calls_for_you(&self.calling, &s.tab),
                     blink_on,
-                }
+                };
+                render_row(content, s, style, content_width, pos_width);
+                style
             } else {
                 HighlightStyle::default()
             };
@@ -696,22 +807,23 @@ impl State {
     /// `TabUpdate`: refreshes the tab cache, the scores and visibility.
     fn on_tab_update(&mut self, new_tabs: Vec<TabInfo>) -> bool {
         // Visibility first, ahead of the dedup below. `hide()` resets the
-        // local flags while `self.tabs` keeps the pre-hide snapshot, and a
-        // hidden plugin receives no updates at all, so the `TabUpdate` that
-        // arrives on reopen can be identical to that snapshot. Skipping it
-        // must not leave `float_visible` stale. (`are_floating_panes_visible`
-        // of the active tab co-determines visibility: a click into the
-        // background pane hides the floating layer without changing
-        // `is_focused`.) Any update proves our tab is the active one, which
-        // retires a host-side `Visible(false)`.
+        // local flags while `self.tabs` keeps the pre-hide snapshot, and
+        // before Zellij 0.46 a hidden plugin receives no updates at all, so
+        // the `TabUpdate` that arrives on reopen can be identical to that
+        // snapshot. Skipping it must not leave `float_visible` stale.
+        // (`are_floating_panes_visible` of the active tab co-determines
+        // visibility: a click into the background pane hides the floating
+        // layer without changing `is_focused`.) Any update proves our tab
+        // is the active one, which retires a host-side `Visible(false)`.
         self.vis.host_visible = None;
         self.vis.float_visible = new_tabs
             .iter()
             .find(|t| t.active)
             .is_some_and(|t| t.are_floating_panes_visible);
         // Dedup: Zellij fires `TabUpdate` often without changes. `PartialEq`
-        // on `TabInfo` covers all fields, including `has_bell_notification`,
-        // so only the cheap visibility bookkeeping runs for a repeat.
+        // on `TabInfo` covers all fields, including `has_bell_notification`
+        // and `attention`, so only the cheap visibility bookkeeping runs for
+        // a repeat.
         let unchanged = self.tabs_received
             && self.tabs.len() == new_tabs.len()
             && new_tabs.iter().zip(&self.tabs).all(|(n, e)| *n == *e.info);
@@ -720,6 +832,7 @@ impl State {
             self.start_blink_if_needed();
             return became_visible;
         }
+        let kept = self.moved_selection();
         self.tabs_received = true;
         // Cache the fuzzy haystacks once per `TabUpdate` (not per keystroke
         // × tab).
@@ -737,21 +850,45 @@ impl State {
         let live: Vec<usize> = self.tabs.iter().map(|e| e.info.tab_id).collect();
         self.access_counts.retain(|id, _| live.contains(id));
         self.refresh_scores();
+        self.restore_selection(kept);
         self.recompute_visibility();
-        // A newly arriving bell may need to start the loop even without a
-        // visibility transition — `start_blink_if_needed` is idempotent.
+        // A tab that newly calls for you may need to start the loop even
+        // without a visibility transition; `start_blink_if_needed` is
+        // idempotent.
         self.start_blink_if_needed();
         true
     }
 
-    /// `PaneUpdate`: derives the `pane_focused` visibility indicator and
-    /// re-asserts the pane geometry when Zellij changed it.
+    /// The tab of a selection the user moved, for `restore_selection` after
+    /// the list is rebuilt. Such a selection stays on its tab: a tab that
+    /// newly calls for you jumps to the top of the empty-query list, and
+    /// Enter or a second click must still reach the tab the user picked.
+    fn moved_selection(&self) -> Option<usize> {
+        self.scored
+            .get(self.selected)
+            .filter(|_| self.selection_moved)
+            .map(|s| s.tab.tab_id)
+    }
+
+    /// Puts the selection back on tab `kept` (a `tab_id` from
+    /// `moved_selection`) if the rebuilt list still holds it.
+    fn restore_selection(&mut self, kept: Option<usize>) {
+        if let Some(index) = kept.and_then(|id| self.scored.iter().position(|s| s.tab.tab_id == id))
+        {
+            self.selected = index;
+        }
+    }
+
+    /// `PaneUpdate`: records which tabs call for you, derives the
+    /// `pane_focused` visibility indicator and re-asserts the pane geometry
+    /// when Zellij changed it.
     fn on_pane_update(&mut self, manifest: &PaneManifest) -> bool {
         if !self.ready {
             return false;
         }
         // Updates only reach plugins in the active tab — see `Visibility`.
         self.vis.host_visible = None;
+        let calling_changed = self.update_calling(manifest);
         let pid = self.plugin_id;
         let own_pane = manifest.panes.iter().find_map(|(tab_position, panes)| {
             panes
@@ -762,34 +899,59 @@ impl State {
         let Some((tab_position, pane)) = own_pane else {
             // Not in the manifest (e.g. mid-move): treat as unfocused.
             self.vis.pane_focused = false;
-            return self.recompute_visibility();
+            return self.recompute_visibility() || calling_changed;
         };
         let pane_focused_now = pane.is_floating && !pane.is_suppressed && pane.is_focused;
         // Every reopen re-inserts the floating pane at Zellij's default
         // geometry (half the viewport, with a frame content offset):
         // `hide_self` takes it out of the floating layer and
-        // `LaunchOrFocusPlugin` adds it back as if new. A hidden plugin gets
-        // no updates, so the rising edge of `pane_focused` is the first
-        // signal that the pane is back — re-assert unconditionally there.
+        // `LaunchOrFocusPlugin` adds it back as if new. The rising edge of
+        // `pane_focused` is the first signal that the pane is back (a hidden
+        // plugin gets no updates before 0.46, and a suppressed pane is never
+        // focused), so re-assert unconditionally there. Only a floating pane
+        // is re-asserted: Zellij reports a hidden (suppressed) pane as not
+        // floating, and a coordinates change would move it back into the
+        // floating layer, i.e. show the closed picker again.
         let reappeared = pane_focused_now && !self.vis.pane_focused;
         if pane.is_floating
-            && (reappeared
-                || self.geometry_needs_reassert(tab_position, pane.pane_columns, pane.pane_rows))
+            && self.take_reassert(reappeared, tab_position, pane.pane_columns, pane.pane_rows)
         {
             self.resize_pane();
         }
         self.vis.pane_focused = pane_focused_now;
-        self.recompute_visibility()
+        self.recompute_visibility() || calling_changed
+    }
+
+    /// Records which tabs call for you (see `pane_calls_for_you`). On a
+    /// change it rebuilds the list, keeps a moved selection on its tab and
+    /// starts the blink loop if a listed tab now calls. Returns whether
+    /// anything changed. `PaneManifest` keys the panes by tab position. When
+    /// tabs move, Zellij sends this update right before the matching
+    /// `TabUpdate`, so a row can show a stale state for one render at most.
+    fn update_calling(&mut self, manifest: &PaneManifest) -> bool {
+        let calling: BTreeSet<usize> = manifest
+            .panes
+            .iter()
+            .filter(|(_, panes)| panes.iter().any(pane_calls_for_you))
+            .map(|(position, _)| *position)
+            .collect();
+        if calling == self.calling {
+            return false;
+        }
+        self.calling = calling;
+        let kept = self.moved_selection();
+        self.refresh_scores();
+        self.restore_selection(kept);
+        self.start_blink_if_needed();
+        true
     }
 
     /// Whether the floating pane's current geometry warrants re-sending the
     /// target size. Larger than target: always — `viewport >= pane > target`,
-    /// so the request succeeds. Smaller than target: only when the target
+    /// so the target fits. Smaller than target: only when the target
     /// fits the tab's viewport; Zellij centres a width/height-only request,
     /// so "fits" means it succeeds, while a pane that is small because the
     /// terminal is small is left alone (render caps the box to the pane).
-    /// This can never storm: a floating-pane resize emits no `PaneUpdate`
-    /// (Zellij only schedules a repaint), so nothing feeds back.
     fn geometry_needs_reassert(&self, tab_position: usize, cols: usize, rows: usize) -> bool {
         let (target_cols, target_rows) = (self.size.cols, self.size.rows);
         if cols == target_cols && rows == target_rows {
@@ -804,6 +966,33 @@ impl State {
             .is_some_and(|e| {
                 target_cols <= e.info.viewport_columns && target_rows <= e.info.viewport_rows
             })
+    }
+
+    /// Decides whether this `PaneUpdate` re-sends the target geometry: always
+    /// on a reopen, otherwise when `geometry_needs_reassert` says so, but at
+    /// most `MAX_GEOMETRY_REASSERTS` times until the pane is seen at its
+    /// target size or reopens. Before Zellij 0.46 a floating-pane resize
+    /// emits no `PaneUpdate`, so retries only follow structural changes.
+    /// From 0.46 every resize reports the session state back, and a pane
+    /// that stays off-target despite the request (e.g. made fullscreen)
+    /// would otherwise loop request and report forever.
+    fn take_reassert(
+        &mut self,
+        reappeared: bool,
+        tab_position: usize,
+        cols: usize,
+        rows: usize,
+    ) -> bool {
+        let on_target = cols == self.size.cols && rows == self.size.rows;
+        if reappeared || on_target {
+            self.geometry_reasserts = 0;
+        }
+        let wanted = reappeared || self.geometry_needs_reassert(tab_position, cols, rows);
+        if !wanted || self.geometry_reasserts >= MAX_GEOMETRY_REASSERTS {
+            return false;
+        }
+        self.geometry_reasserts += 1;
+        true
     }
 
     /// `Timer`: dispatches to the quickjump or the blink handler.
@@ -833,30 +1022,37 @@ impl State {
         self.try_instant_jump(pos)
     }
 
-    /// Bell-blink tick: toggles the background and re-arms while the
-    /// plugin is visible and a bell tab exists; otherwise the loop ends.
+    /// Blink tick: toggles the alert background and re-arms while the
+    /// plugin is visible and a listed tab calls for you; otherwise the loop
+    /// ends.
     fn on_blink_timer(&mut self) -> bool {
-        if self.vis.visible && self.has_bell_tab() {
-            self.timers.bell_blink_on = !self.timers.bell_blink_on;
+        if self.vis.visible && self.any_listed_calls_for_you() {
+            self.timers.blink_on = !self.timers.blink_on;
             self.arm_timer(TimerKind::Blink, BLINK_INTERVAL);
             true
         } else {
             // Conditions gone — loop terminates. Restarted by
-            // `recompute_visibility` (`became_visible`) or `TabUpdate` as
-            // soon as conditions hold again.
-            self.timers.bell_blink_on = false;
+            // `recompute_visibility` (`became_visible`), a `TabUpdate`, a
+            // `PaneUpdate` or a query change as soon as conditions hold again.
+            self.timers.blink_on = false;
             false
         }
     }
 
-    /// True when at least one tab has a bell notification.
-    fn has_bell_tab(&self) -> bool {
-        self.tabs.iter().any(|e| e.info.has_bell_notification)
+    /// True when a tab in the list calls for you, so a row can blink. The
+    /// active tab is the header and never in the list, and neither is a tab
+    /// the query filters out.
+    fn any_listed_calls_for_you(&self) -> bool {
+        self.scored
+            .iter()
+            .any(|s| calls_for_you(&self.calling, &s.tab))
     }
 
     /// `Visible`: the host's visibility signal (see `Visibility`). A
-    /// `false` stops the blink loop on its next tick and parks the
-    /// quickjump timeout; a `true` re-renders and restarts the loop.
+    /// `false` stops the blink loop on its next tick and cancels a pending
+    /// quickjump timeout (the digits stay in the query); a `true` lifts that
+    /// veto, so the picker re-renders and the loop restarts as soon as the
+    /// local indicators agree.
     fn on_visible(&mut self, shown: bool) -> bool {
         self.vis.host_visible = Some(shown);
         self.recompute_visibility()
@@ -877,10 +1073,10 @@ impl State {
         became_visible
     }
 
-    /// Starts the bell-blink tick when (a) the plugin is visible, (b) a
-    /// bell tab exists, and (c) no tick is already in flight.
+    /// Starts the blink tick when (a) the plugin is visible, (b) a listed
+    /// tab calls for you, and (c) no tick is already in flight.
     fn start_blink_if_needed(&mut self) {
-        if !self.vis.visible || !self.has_bell_tab() || self.timers.blink_in_flight() {
+        if !self.vis.visible || !self.any_listed_calls_for_you() || self.timers.blink_in_flight() {
             return;
         }
         self.arm_timer(TimerKind::Blink, BLINK_INTERVAL);
@@ -911,9 +1107,15 @@ impl State {
                     self.jump_to_selected();
                 } else {
                     self.selected = idx;
+                    self.selection_moved = true;
                 }
                 true
             }
+            // Everything else, including the `DoubleClick` that Zellij 0.46
+            // sends after the second `LeftClick` of a double click: that
+            // click already confirmed the row, so reacting to `DoubleClick`
+            // too would jump a second time, on the list as it stands after
+            // the first jump.
             _ => false,
         }
     }
@@ -944,6 +1146,7 @@ impl State {
         };
         let moved = target != self.selected;
         self.selected = target;
+        self.selection_moved |= moved;
         moved
     }
 
@@ -990,20 +1193,22 @@ impl State {
         // counts persist.
         self.query.clear();
         self.selected = 0;
+        self.selection_moved = false;
         self.scroll_offset = 0;
         self.refresh_scores();
         // Mark invisible locally right away: `PaneUpdate`/`TabUpdate` would
-        // do the same, but a hidden plugin never receives them.
+        // do the same, but before Zellij 0.46 a hidden plugin never receives
+        // them.
         // `pane_focused = false` also arms the rising-edge detection that
         // re-asserts the geometry on the next open.
         self.vis = Visibility::default();
-        // Void pending quickjump timers — zellij-tile has no cancel API, the
-        // events still arrive and must no-op. The blink timer, if any, stays
-        // queued: it terminates itself on its next tick because `visible`
-        // is false, and keeping it queued is exactly what stops
+        // Void pending quickjump timers — zellij-tile has no cancel API; the
+        // events still arrive and must do nothing. The blink timer, if any,
+        // stays queued: it terminates itself on its next tick because
+        // `visible` is false, and keeping it queued is exactly what stops
         // `start_blink_if_needed` from arming a second chain on reopen.
         self.timers.new_jump_generation();
-        self.timers.bell_blink_on = false;
+        self.timers.blink_on = false;
         hide_self();
     }
 
@@ -1013,23 +1218,29 @@ impl State {
 
     fn query_changed(&mut self) {
         self.selected = 0;
+        self.selection_moved = false;
         self.scroll_offset = 0;
         self.refresh_scores();
+        // The new list may hold a tab that calls for you.
+        self.start_blink_if_needed();
     }
 
-    fn delete_word_backward(&mut self) {
-        while matches!(self.query.chars().last(), Some(c) if c.is_whitespace()) {
-            self.query.pop();
-        }
-        while matches!(self.query.chars().last(), Some(c) if !c.is_whitespace()) {
-            self.query.pop();
+    /// Applies a deleting `edit` to the query. Only an actual change resets
+    /// the selection and rebuilds the list, so a Backspace on an empty query
+    /// keeps the row the user moved to. Returns whether the query changed.
+    fn edit_query(&mut self, edit: impl FnOnce(&mut String)) -> bool {
+        let before = self.query.len();
+        edit(&mut self.query);
+        if self.query.len() == before {
+            return false;
         }
         self.query_changed();
+        true
     }
 
     /// Checks whether `c` is the next digit of an in-progress quickjump
-    /// buffer: query must be empty (first digit) or already all-digit
-    /// non-zero-start, and must not yet have reached the full digit
+    /// buffer: the query must be empty (first digit) or consist of digits
+    /// without a leading zero, and must not yet have reached the full digit
     /// count `digit_count(tabs.len())`. `c == '0'` as the first digit
     /// falls through to the regular query.
     fn is_jump_pending_for(&self, c: char) -> bool {
@@ -1127,20 +1338,11 @@ impl State {
                 self.move_selection(Direction::Down);
                 true
             }
-            BareKey::Backspace => {
-                self.query.pop();
-                self.query_changed();
-                true
-            }
-            BareKey::Char('w') if has_ctrl => {
-                self.delete_word_backward();
-                true
-            }
-            BareKey::Char('u') if has_ctrl => {
-                self.query.clear();
-                self.query_changed();
-                true
-            }
+            BareKey::Backspace => self.edit_query(|query| {
+                query.pop();
+            }),
+            BareKey::Char('w') if has_ctrl => self.edit_query(delete_word_backward),
+            BareKey::Char('u') if has_ctrl => self.edit_query(String::clear),
             BareKey::Char(c)
                 if !has_ctrl && !has_alt && c.is_ascii_digit() && self.is_jump_pending_for(c) =>
             {
@@ -1163,6 +1365,7 @@ impl State {
     }
 
     fn move_selection(&mut self, dir: Direction) {
+        self.selection_moved = true;
         let len = self.scored.len();
         if len == 0 {
             self.selected = 0;
@@ -1180,8 +1383,8 @@ impl State {
         };
     }
 
-    /// Rebuilds `scored` for the current query: the unfiltered list in
-    /// frequency order when the query is empty, the search otherwise.
+    /// Rebuilds `scored` for the current query: the unfiltered list (see
+    /// `list_by_frequency`) when the query is empty, the search otherwise.
     fn refresh_scores(&mut self) {
         if self.query.is_empty() {
             self.list_by_frequency();
@@ -1191,11 +1394,13 @@ impl State {
         self.clamp_selection();
     }
 
-    /// Empty query: every tab except the active one (that is the header),
-    /// most-used first, then by position. Reuses the `scored` allocation
-    /// (clear + extend) so its capacity survives across `TabUpdate`s.
+    /// Empty query: every tab except the active one (that is the header).
+    /// Tabs that call for you come first, then the most-used, then by
+    /// position. Reuses the `scored` allocation (clear + extend) so its
+    /// capacity survives across `TabUpdate`s.
     fn list_by_frequency(&mut self) {
         let counts = &self.access_counts;
+        let calling = &self.calling;
         self.scored.clear();
         self.scored
             .extend(self.tabs.iter().filter(|e| !e.info.active).map(|e| Scored {
@@ -1203,11 +1408,12 @@ impl State {
                 tab: Rc::clone(&e.info),
                 indices: Vec::new(),
             }));
-        self.scored.sort_by(|a, b| {
-            let ca = counts.get(&a.tab.tab_id).copied().unwrap_or(0);
-            let cb = counts.get(&b.tab.tab_id).copied().unwrap_or(0);
-            cb.cmp(&ca)
-                .then_with(|| a.tab.position.cmp(&b.tab.position))
+        self.scored.sort_by_key(|s| {
+            (
+                Reverse(calls_for_you(calling, &s.tab)),
+                Reverse(counts.get(&s.tab.tab_id).copied().unwrap_or(0)),
+                s.tab.position,
+            )
         });
     }
 
@@ -1302,8 +1508,11 @@ fn render_active_row(out: &mut String, tab: &TabInfo, cols: usize) {
     // pane_str renders as "[N]" — visible width = digit_count(N) + 2.
     // Computed by formula instead of format-then-measure to skip an alloc.
     let pane_len = digit_count(panes) + 2;
-    // Layout: name + gap + "  " (2-space separator) + pane_str
-    let name_area = cols.saturating_sub(2 + pane_len);
+    // An attention marker, if any, leads the name as "{symbol} ".
+    let marker = Marker::for_tab(tab).map(Marker::symbol);
+    let marker_len = marker.map_or(0, |m| visible_len(m) + 1);
+    // Layout: marker + name + gap + "  " (2-space separator) + pane_str
+    let name_area = cols.saturating_sub(marker_len + 2 + pane_len);
 
     // Defensive: on extremely narrow panes, show only the truncated name
     // to avoid overflow.
@@ -1316,6 +1525,10 @@ fn render_active_row(out: &mut String, tab: &TabInfo, cols: usize) {
     }
 
     out.push_str(ACTIVE);
+    if let Some(m) = marker {
+        out.push_str(m);
+        out.push(' ');
+    }
     let name_written = push_truncated_name(out, &tab.name, &[], name_area, RESET);
     out.push_str(RESET);
     out.push_str(DIM);
@@ -1324,20 +1537,17 @@ fn render_active_row(out: &mut String, tab: &TabInfo, cols: usize) {
     out.push_str(RESET);
 }
 
-fn render_row(
-    out: &mut String,
-    s: &Scored,
-    selected: bool,
-    cols: usize,
-    pos_width: usize,
-    blink_on: bool,
-) {
+fn render_row(out: &mut String, s: &Scored, style: HighlightStyle, cols: usize, pos_width: usize) {
     let tab = &*s.tab;
-    // num_prefix renders as "{pos:>pos_width$} - " — visible width is
-    // pos_width + 3 (the trailing " - "). pane_str renders as "[N]" with
-    // visible width digit_count(N) + 2. Both widths are derived by formula
-    // to skip per-row format-then-measure allocations.
-    let num_prefix_len = pos_width + 3;
+    // The attention marker takes the place of the separator dash.
+    let marker = Marker::for_tab(tab);
+    let sep = marker.map_or("-", Marker::symbol);
+    // num_prefix renders as "{pos:>pos_width$} {sep} ": pos_width plus the
+    // separator (one cell for the dash and for every marker glyph) plus two
+    // spaces. pane_str renders as "[N]", visible width digit_count(N) + 2.
+    // Both widths are derived by formula to skip per-row format-then-measure
+    // allocations.
+    let num_prefix_len = pos_width + 2 + visible_len(sep);
     let panes = tab.selectable_tiled_panes_count + tab.selectable_floating_panes_count;
     let pane_len = digit_count(panes) + 2;
     // Layout: num_prefix + name + gap + "  " (2-space separator) + pane_str
@@ -1351,26 +1561,34 @@ fn render_row(
         return;
     }
 
-    let bell = tab.has_bell_notification;
-    let lit = if bell { blink_on } else { true };
-    // Highlighted inner: outer style (selected REVERSE or bell bg) sits
-    // on top → inner stays plain. Otherwise (no highlight): DIM inner.
-    let highlighted = lit && (selected || bell);
+    let lit = !style.alert || style.blink_on;
+    // Highlighted inner: outer style (`SELECTED` or alert bg) sits on top,
+    // so the inner stays plain. Otherwise (no highlight): DIM number,
+    // styled marker.
+    let highlighted = lit && (style.selected || style.alert);
     let pos = tab.position + 1;
 
     if highlighted {
-        // Match indices only when not selected — REVERSE would mask them.
-        // Inside a bell row every match run must restore the bell
-        // background, not reset to plain.
-        let indices: &[u32] = if selected { &[] } else { &s.indices };
-        let _ = write!(out, "{pos:>pos_width$} - ");
-        let name_written = push_truncated_name(out, &tab.name, indices, name_area, BELL_RESTORE);
+        // Match indices only when not selected: the restore after each match
+        // run would replace `SELECTED` for the rest of the row. Inside an
+        // alert row every match run must restore the alert background, not
+        // reset to plain.
+        let indices: &[u32] = if style.selected { &[] } else { &s.indices };
+        let _ = write!(out, "{pos:>pos_width$} {sep} ");
+        let name_written = push_truncated_name(out, &tab.name, indices, name_area, ALERT_RESTORE);
         push_pad(out, name_area.saturating_sub(name_written));
         let _ = write!(out, "  [{panes}]");
     } else {
         out.push_str(DIM);
-        let _ = write!(out, "{pos:>pos_width$} - ");
+        let _ = write!(out, "{pos:>pos_width$} ");
         out.push_str(RESET);
+        let sep_style = marker.map_or(DIM, Marker::style);
+        out.push_str(sep_style);
+        out.push_str(sep);
+        if !sep_style.is_empty() {
+            out.push_str(RESET);
+        }
+        out.push(' ');
         let name_written = push_truncated_name(out, &tab.name, &s.indices, name_area, RESET);
         push_pad(out, name_area.saturating_sub(name_written));
         out.push_str("  ");
@@ -1383,8 +1601,8 @@ fn render_row(
 /// Writes the (possibly truncated) tab name directly into `out`, with
 /// match highlighting at every position in `indices` (sorted ascending;
 /// duplicates are tolerated). `restore` is the SGR emitted after each
-/// highlighted char — `RESET` on plain rows, `BELL_RESTORE` inside a bell
-/// row. Truncation and the return value are measured in display cells
+/// highlighted char — `RESET` on plain rows, `ALERT_RESTORE` inside an
+/// alert row. Truncation and the return value are measured in display cells
 /// (UAX #11), not codepoints, so wide chars (emoji, CJK) do not break
 /// frame alignment. Returns the number of visible cells written.
 fn push_truncated_name(
@@ -1564,6 +1782,17 @@ fn sanitize_char(c: char) -> char {
     }
 }
 
+/// Ctrl-w: deletes the word before the cursor (the end of the query) and
+/// any whitespace between that word and the cursor.
+fn delete_word_backward(query: &mut String) {
+    while query.ends_with(char::is_whitespace) {
+        query.pop();
+    }
+    while query.ends_with(|c: char| !c.is_whitespace()) {
+        query.pop();
+    }
+}
+
 /// True when `query` is a valid pending-quickjump buffer: non-empty,
 /// only ASCII digits, and not starting with `0`.
 fn is_pending_jump_buffer(query: &str) -> bool {
@@ -1626,9 +1855,20 @@ fn visible_len(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()
+    }
+
+    #[test]
+    fn load_applies_the_configured_size() {
+        let mut state = State::default();
+        state.load(BTreeMap::from([
+            ("max_cols".to_string(), "80".to_string()),
+            ("max_rows".to_string(), "24".to_string()),
+        ]));
+        assert_eq!((state.size.cols, state.size.rows), (80, 24));
     }
 
     #[test]
@@ -1748,10 +1988,10 @@ mod tests {
 
     #[test]
     fn truncated_name_emits_restore_sequence() {
-        // Inside a bell row the restore sequence re-applies the bell bg.
+        // Inside an alert row the restore sequence re-applies the alert bg.
         let mut s = String::new();
-        push_truncated_name(&mut s, "abc", &[1], 10, BELL_RESTORE);
-        assert_eq!(s, format!("a{MATCH}b{BELL_RESTORE}c"));
+        push_truncated_name(&mut s, "abc", &[1], 10, ALERT_RESTORE);
+        assert_eq!(s, format!("a{MATCH}b{ALERT_RESTORE}c"));
     }
 
     #[test]
@@ -1885,7 +2125,8 @@ mod tests {
         // both handlers still run exactly once.
         assert_eq!(t.resolve(0.55), Some(TimerKind::Blink));
         assert_eq!(t.resolve(0.5), Some(TimerKind::Jump { generation: 1 }));
-        // Below every requested duration (clock skew): fall back to oldest.
+        // Below every requested duration (clock skew): fall back to the
+        // oldest.
         t.armed(TimerKind::Jump { generation: 2 }, JUMP_TIMEOUT);
         assert_eq!(t.resolve(0.1), Some(TimerKind::Jump { generation: 2 }));
     }
@@ -2054,6 +2295,600 @@ mod tests {
         state.scored.iter().map(|s| s.tab.name.as_str()).collect()
     }
 
+    /// Applies `change` to the `TabInfo` of tab `index`.
+    fn set_tab(state: &mut State, index: usize, change: impl FnOnce(&mut TabInfo)) {
+        let mut tab = (*state.tabs[index].info).clone();
+        change(&mut tab);
+        state.tabs[index].info = Rc::new(tab);
+    }
+
+    /// Sets the attention status Zellij 0.46 reports for tab `index`.
+    fn set_status(state: &mut State, index: usize, status: AttentionStatus) {
+        set_tab(state, index, |t| t.attention.status = status);
+    }
+
+    #[test]
+    fn marker_follows_zellij_tab_bar() {
+        use AttentionStatus::{Done, Failed, Idle, NeedsYou, NewOutput, Quiet, Working};
+        let tab = |status: AttentionStatus, muted: bool, bell: bool, flashing: bool| TabInfo {
+            attention: TabAttention {
+                status,
+                muted,
+                ..TabAttention::default()
+            },
+            has_bell_notification: bell,
+            is_flashing_bell: flashing,
+            ..TabInfo::default()
+        };
+        for status in [NeedsYou, Failed, Done, Working] {
+            let marker = Marker::for_tab(&tab(status, false, false, false));
+            assert_eq!(marker, Some(Marker::Status(status)));
+            assert_eq!(visible_len(Marker::Status(status).symbol()), 1);
+        }
+        for status in [Idle, Quiet, NewOutput] {
+            assert_eq!(Marker::for_tab(&tab(status, false, false, false)), None);
+        }
+        // The bell counts as "needs you", also on hosts without attention
+        // state; a counted status wins over it.
+        let rung = Some(Marker::Status(NeedsYou));
+        assert_eq!(Marker::for_tab(&tab(Idle, false, true, false)), rung);
+        assert_eq!(Marker::for_tab(&tab(Idle, false, false, true)), rung);
+        assert_eq!(
+            Marker::for_tab(&tab(Working, false, true, false)),
+            Some(Marker::Status(Working))
+        );
+        // Muted tabs show the muted mark.
+        let muted = tab(NeedsYou, true, true, false);
+        assert_eq!(Marker::for_tab(&muted), Some(Marker::Muted));
+        assert_eq!(Marker::Muted.symbol(), "⊘");
+        assert_eq!(visible_len(Marker::Muted.symbol()), 1);
+        // Urgent marks bold, muted dim, the rest plain.
+        assert_eq!(Marker::Status(NeedsYou).style(), BOLD);
+        assert_eq!(Marker::Status(Failed).style(), BOLD);
+        assert_eq!(Marker::Status(Done).style(), "");
+        assert_eq!(Marker::Status(Working).style(), "");
+        assert_eq!(Marker::Muted.style(), DIM);
+    }
+
+    /// A terminal pane whose attention Zellij 0.46 reports as `status` from
+    /// `source`.
+    fn attention_pane(status: AttentionStatus, source: Option<AttentionSource>) -> PaneInfo {
+        PaneInfo {
+            attention: PaneAttention {
+                status,
+                source,
+                ..PaneAttention::default()
+            },
+            ..PaneInfo::default()
+        }
+    }
+
+    /// A `PaneUpdate` with the given panes, each in its tab position.
+    fn manifest(panes: Vec<(usize, PaneInfo)>) -> PaneManifest {
+        let mut manifest = PaneManifest::default();
+        for (position, pane) in panes {
+            manifest.panes.entry(position).or_default().push(pane);
+        }
+        manifest
+    }
+
+    #[test]
+    fn programs_notifications_and_watches_call_for_you_but_bare_bells_do_not() {
+        use AttentionSource::{
+            Bell, CommandPane, ForegroundProcess, IdleRule, Notification, ProgramStatus,
+            ShellCommand, UnseenOutput, Watch,
+        };
+        use AttentionStatus::{Done, Failed, Idle, NeedsYou, NewOutput, Quiet, Working};
+        // A program's own report calls while it waits for you and once it
+        // has finished or failed, not while it works or idles.
+        for status in [NeedsYou, Done, Failed] {
+            assert!(pane_calls_for_you(&attention_pane(
+                status,
+                Some(ProgramStatus)
+            )));
+        }
+        for status in [Working, Idle, NewOutput, Quiet] {
+            assert!(!pane_calls_for_you(&attention_pane(
+                status,
+                Some(ProgramStatus)
+            )));
+        }
+        assert!(pane_calls_for_you(&attention_pane(
+            NeedsYou,
+            Some(Notification)
+        )));
+        assert!(pane_calls_for_you(&attention_pane(NeedsYou, Some(Watch))));
+        // A bell calls only from the pane of a program that reports its
+        // state (Claude Code rings when it waits for input).
+        let mut bell = attention_pane(NeedsYou, Some(Bell));
+        assert!(!pane_calls_for_you(&bell));
+        // zellij-tile does not export the record type, hence `resize_with`.
+        bell.program_status.resize_with(1, Default::default);
+        assert!(pane_calls_for_you(&bell));
+        // Finished shell commands and everything else never call.
+        for (status, source) in [
+            (Done, ShellCommand),
+            (Failed, ShellCommand),
+            (Done, CommandPane),
+            (Failed, CommandPane),
+            (Working, ForegroundProcess),
+            (Quiet, IdleRule),
+            (NewOutput, UnseenOutput),
+        ] {
+            assert!(!pane_calls_for_you(&attention_pane(status, Some(source))));
+        }
+        assert!(!pane_calls_for_you(&attention_pane(NeedsYou, None)));
+        // Muted panes never call.
+        for scope in [MuteScope::Pane, MuteScope::Tab, MuteScope::Session] {
+            let mut muted = attention_pane(NeedsYou, Some(ProgramStatus));
+            muted.attention.muted = Some(scope);
+            assert!(!pane_calls_for_you(&muted));
+        }
+    }
+
+    #[test]
+    fn calling_tabs_lead_the_empty_query_list() {
+        use AttentionSource::{Bell, ProgramStatus, ShellCommand};
+        use AttentionStatus::{Done, Failed, NeedsYou, Working};
+        let mut state = state_with_tabs(&["active", "alpha", "beta", "gamma", "delta", "eps"]);
+        state.ready = true;
+        state.access_counts.insert(3, 5); // gamma: most used
+        set_tab(&mut state, 1, |t| t.has_bell_notification = true); // alpha
+        set_status(&mut state, 2, Failed); // beta
+        set_status(&mut state, 4, Done); // delta
+        set_status(&mut state, 5, NeedsYou); // eps
+        let report = manifest(vec![
+            (1, attention_pane(NeedsYou, Some(Bell))),
+            (2, attention_pane(Failed, Some(ShellCommand))),
+            (4, attention_pane(Done, Some(ProgramStatus))),
+            (5, attention_pane(Working, None)),
+            (5, attention_pane(NeedsYou, Some(ProgramStatus))),
+        ]);
+        assert!(state.on_pane_update(&report));
+        // The finished agent in delta and the waiting one in eps come first
+        // (then frequency, then position); a bare bell and a failed shell
+        // command keep their markers but do not move up.
+        assert_eq!(
+            listed_names(&state),
+            vec!["delta", "eps", "gamma", "alpha", "beta"]
+        );
+        assert!(state.any_listed_calls_for_you());
+        // The same report again changes nothing and needs no render.
+        assert!(!state.on_pane_update(&report));
+
+        // No tab status (`attention.tab_markers` off) or a muted tab: no call.
+        set_status(&mut state, 4, AttentionStatus::Idle);
+        set_tab(&mut state, 5, |t| t.attention.muted = true);
+        state.refresh_scores();
+        assert_eq!(
+            listed_names(&state),
+            vec!["gamma", "alpha", "beta", "delta", "eps"]
+        );
+        assert!(!state.any_listed_calls_for_you());
+
+        // The active tab is the header: it never keeps the blink alive.
+        let mut state = state_with_tabs(&["active", "alpha"]);
+        state.ready = true;
+        set_status(&mut state, 0, NeedsYou);
+        state.on_pane_update(&manifest(vec![(
+            0,
+            attention_pane(NeedsYou, Some(ProgramStatus)),
+        )]));
+        assert!(!state.any_listed_calls_for_you());
+    }
+
+    /// Makes tab `index` call for you the way Zellij 0.46 reports it: the
+    /// pane's state in a `PaneUpdate`, the tab's status in a `TabUpdate`,
+    /// in either order.
+    fn start_calling(state: &mut State, index: usize, pane_first: bool) {
+        let report = manifest(vec![(
+            index,
+            attention_pane(
+                AttentionStatus::NeedsYou,
+                Some(AttentionSource::ProgramStatus),
+            ),
+        )]);
+        if pane_first {
+            state.on_pane_update(&report);
+        }
+        let mut tabs: Vec<TabInfo> = state.tabs.iter().map(|e| (*e.info).clone()).collect();
+        tabs[index].attention.status = AttentionStatus::NeedsYou;
+        state.on_tab_update(tabs);
+        if !pane_first {
+            state.on_pane_update(&report);
+        }
+    }
+
+    #[test]
+    fn a_moved_selection_stays_on_its_tab_when_the_list_reorders() {
+        // gamma starts calling for you while the picker is open and moves to
+        // the top, whichever of Zellij's two reports completes it; a
+        // selection the user moved to beta, by key, wheel or click, must
+        // stay on beta.
+        let by_key: fn(&mut State) = |s| s.move_selection(Direction::Down);
+        let by_wheel: fn(&mut State) = |s| {
+            s.handle_mouse(&Mouse::ScrollDown(3));
+        };
+        let by_click: fn(&mut State) = |s| {
+            s.list_area = Some(ListArea {
+                top: 5,
+                rows: 10,
+                left: 0,
+                width: 60,
+            });
+            s.handle_mouse(&Mouse::LeftClick(6, 10));
+        };
+        for pane_first in [true, false] {
+            for select_beta in [by_key, by_wheel, by_click] {
+                let mut state = state_with_tabs(&["active", "alpha", "beta", "gamma"]);
+                state.ready = true;
+                state.refresh_scores();
+                select_beta(&mut state);
+                assert_eq!(state.scored[state.selected].tab.name, "beta");
+                start_calling(&mut state, 3, pane_first);
+                assert_eq!(listed_names(&state), vec!["gamma", "alpha", "beta"]);
+                assert_eq!(state.scored[state.selected].tab.name, "beta");
+
+                // Then beta closes: the selection falls back into the list.
+                let rest: Vec<TabInfo> = state
+                    .tabs
+                    .iter()
+                    .map(|e| (*e.info).clone())
+                    .filter(|t| t.name != "beta")
+                    .collect();
+                state.on_tab_update(rest);
+                assert_eq!(listed_names(&state), vec!["gamma", "alpha"]);
+                assert_eq!(state.selected, 1);
+            }
+        }
+
+        // An untouched selection stays on the first row, where gamma lands
+        // once it calls for you; so does a selection moved to beta that
+        // closing the picker or editing the query reset (Zellij 0.46 keeps
+        // sending updates to the hidden picker).
+        let untouched: fn(&mut State) = |_| {};
+        let closed: fn(&mut State) = |s| {
+            s.move_selection_by(Direction::Down, 1);
+            s.hide();
+        };
+        let edited: fn(&mut State) = |s| {
+            s.move_selection_by(Direction::Down, 1);
+            s.query_changed();
+        };
+        for pane_first in [true, false] {
+            for prepare in [untouched, closed, edited] {
+                let mut state = state_with_tabs(&["active", "alpha", "beta", "gamma"]);
+                state.ready = true;
+                state.refresh_scores();
+                prepare(&mut state);
+                start_calling(&mut state, 3, pane_first);
+                assert_eq!(state.selected, 0);
+                assert_eq!(state.scored[0].tab.name, "gamma");
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_w_and_ctrl_u_edit_the_query_while_plain_w_and_u_type() {
+        let mut state = state_with_tabs(&["active"]);
+        for c in "foo wu".chars() {
+            assert!(state.handle_key(&KeyWithModifier::new(BareKey::Char(c))));
+        }
+        assert_eq!(state.query, "foo wu");
+        let ctrl = |c| KeyWithModifier::new(BareKey::Char(c)).with_ctrl_modifier();
+        assert!(state.handle_key(&ctrl('w')));
+        assert_eq!(state.query, "foo ");
+        assert!(state.handle_key(&ctrl('u')));
+        assert_eq!(state.query, "");
+    }
+
+    #[test]
+    fn blink_loop_runs_only_while_visible_and_a_listed_tab_calls_for_you() {
+        use AttentionSource::{Bell, ProgramStatus};
+        use AttentionStatus::NeedsYou;
+        let mut state = state_with_tabs(&["active", "alpha"]);
+        state.ready = true;
+        state.vis = Visibility {
+            visible: true,
+            pane_focused: true,
+            float_visible: true,
+            host_visible: None,
+        };
+        // The picker's own pane, shown at its target size.
+        let own = PaneInfo {
+            is_plugin: true,
+            is_floating: true,
+            is_focused: true,
+            pane_columns: 60,
+            pane_rows: 20,
+            ..PaneInfo::default()
+        };
+        // Nothing calls for you: no tick is armed, and a stray tick ends.
+        state.start_blink_if_needed();
+        assert!(!state.timers.blink_in_flight());
+        assert!(!state.on_blink_timer());
+        // A bare bell in alpha only marks it.
+        set_tab(&mut state, 1, |t| t.has_bell_notification = true);
+        let bell = manifest(vec![
+            (0, own.clone()),
+            (1, attention_pane(NeedsYou, Some(Bell))),
+        ]);
+        assert!(!state.on_pane_update(&bell));
+        assert!(!state.timers.blink_in_flight());
+        // alpha's agent waits for approval: the `PaneUpdate` starts one
+        // tick, which toggles the phase and re-arms.
+        set_status(&mut state, 1, NeedsYou);
+        let waiting = manifest(vec![
+            (0, own),
+            (1, attention_pane(NeedsYou, Some(ProgramStatus))),
+        ]);
+        assert!(state.on_pane_update(&waiting));
+        assert!(state.timers.blink_in_flight());
+        state.start_blink_if_needed();
+        assert_eq!(state.timers.pending.len(), 1);
+        assert!(state.on_timer(BLINK_INTERVAL));
+        assert!(state.timers.blink_on);
+        assert!(state.timers.blink_in_flight());
+        // Hidden: the next tick ends the loop in the off phase, and no new
+        // one starts while hidden.
+        state.vis.visible = false;
+        assert!(!state.on_timer(BLINK_INTERVAL));
+        assert!(!state.timers.blink_on);
+        assert!(!state.timers.blink_in_flight());
+        state.start_blink_if_needed();
+        assert!(!state.timers.blink_in_flight());
+    }
+
+    #[test]
+    fn a_query_that_hides_every_calling_tab_stops_the_blink_loop() {
+        use AttentionSource::ProgramStatus;
+        use AttentionStatus::NeedsYou;
+        let mut state = state_with_tabs(&["active", "alpha", "beta"]);
+        state.ready = true;
+        state.vis = Visibility {
+            visible: true,
+            pane_focused: true,
+            float_visible: true,
+            host_visible: None,
+        };
+        let own = PaneInfo {
+            is_plugin: true,
+            is_floating: true,
+            is_focused: true,
+            pane_columns: 60,
+            pane_rows: 20,
+            ..PaneInfo::default()
+        };
+        // alpha's agent waits for approval: the loop runs.
+        set_status(&mut state, 1, NeedsYou);
+        state.on_pane_update(&manifest(vec![
+            (0, own),
+            (1, attention_pane(NeedsYou, Some(ProgramStatus))),
+        ]));
+        assert!(state.timers.blink_in_flight());
+        // The query lists beta only, so no row can blink: the next tick ends
+        // the loop instead of re-rendering an unchanged list.
+        for c in "beta".chars() {
+            state.handle_key(&KeyWithModifier::new(BareKey::Char(c)));
+        }
+        assert_eq!(listed_names(&state), vec!["beta"]);
+        assert!(!state.on_timer(BLINK_INTERVAL));
+        assert!(!state.timers.blink_in_flight());
+        // Clearing the query lists alpha again and restarts the loop.
+        let ctrl_u = KeyWithModifier::new(BareKey::Char('u')).with_ctrl_modifier();
+        assert!(state.handle_key(&ctrl_u));
+        assert!(state.timers.blink_in_flight());
+    }
+
+    #[test]
+    fn blink_phases_of_selected_and_alert_rows() {
+        let wrap = |selected, alert, blink_on| {
+            let mut out = String::new();
+            let style = HighlightStyle {
+                selected,
+                alert,
+                blink_on,
+            };
+            append_wrap(&mut out, "x", 10, style);
+            out
+        };
+        for blink_on in [false, true] {
+            // A plain selected row stays highlighted in both phases, a plain
+            // row never is.
+            assert!(wrap(true, false, blink_on).contains(SELECTED));
+            let plain = wrap(false, false, blink_on);
+            assert!(!plain.contains(SELECTED) && !plain.contains(ALERT));
+            // An alert row, selected or not, lights up in the on phase only.
+            assert_eq!(wrap(false, true, blink_on).contains(ALERT), blink_on);
+            assert_eq!(wrap(true, true, blink_on).contains(SELECTED), blink_on);
+        }
+
+        // Inside the row: a lit row (selected, or an alert in its on phase)
+        // is plain text under the outer highlight; otherwise the number is
+        // dim and the marker styled. The marker alone never makes an alert.
+        let row = |bell: bool, alert: bool, selected: bool, blink_on: bool| {
+            let tab = TabInfo {
+                name: "tab".to_string(),
+                has_bell_notification: bell,
+                ..TabInfo::default()
+            };
+            let s = Scored {
+                kind: MatchKind::Listed,
+                tab: Rc::new(tab),
+                indices: Vec::new(),
+            };
+            let style = HighlightStyle {
+                selected,
+                alert,
+                blink_on,
+            };
+            let mut out = String::new();
+            render_row(&mut out, &s, style, 30, 1);
+            out
+        };
+        let styled_bell = format!("{DIM}1 {RESET}{BOLD}●{RESET} tab");
+        assert!(row(false, false, true, false).starts_with("1 - tab"));
+        assert!(row(false, false, true, true).starts_with("1 - tab"));
+        assert!(row(true, true, false, true).starts_with("1 ● tab"));
+        assert!(row(true, true, false, false).starts_with(&styled_bell));
+        assert!(row(true, false, false, true).starts_with(&styled_bell));
+        assert!(
+            row(false, false, false, true).starts_with(&format!("{DIM}1 {RESET}{DIM}-{RESET} tab"))
+        );
+    }
+
+    #[test]
+    fn active_header_shows_its_marker_and_fills_the_row() {
+        let header = |state: &State| {
+            let mut out = String::new();
+            render_active_row(&mut out, &state.tabs[0].info, 30);
+            out
+        };
+        let mut state = state_with_tabs(&["active", "other"]);
+        let plain = header(&state);
+        assert!(plain.starts_with(&format!("{ACTIVE}active")));
+        assert_eq!(visible_len(&plain), 30);
+        set_tab(&mut state, 0, |t| t.has_bell_notification = true);
+        let rung = header(&state);
+        assert!(rung.starts_with(&format!("{ACTIVE}● active")));
+        assert_eq!(visible_len(&rung), 30);
+        set_status(&mut state, 0, AttentionStatus::Working);
+        let working = header(&state);
+        assert!(working.starts_with(&format!("{ACTIVE}◐ active")));
+        assert_eq!(visible_len(&working), 30);
+    }
+
+    /// A `PaneUpdate` reporting the picker's own pane (plugin id 0, as in
+    /// `State::default`) in tab position 0.
+    fn own_pane_update(change: impl FnOnce(&mut PaneInfo)) -> PaneManifest {
+        let mut pane = PaneInfo {
+            is_plugin: true,
+            ..PaneInfo::default()
+        };
+        change(&mut pane);
+        PaneManifest {
+            panes: HashMap::from([(0, vec![pane])]),
+        }
+    }
+
+    #[test]
+    fn only_a_shown_floating_pane_gets_its_geometry_reasserted() {
+        let mut state = state_with_tabs(&["active"]);
+        state.ready = true;
+        state.vis.float_visible = true;
+        set_tab(&mut state, 0, |t| {
+            t.viewport_columns = 100;
+            t.viewport_rows = 30;
+        });
+        // Hidden: Zellij reports the suppressed pane as not floating, and a
+        // resize would bring it back, so even an off-target size stays.
+        let hidden = own_pane_update(|p| {
+            p.is_suppressed = true;
+            p.pane_columns = 100;
+            p.pane_rows = 30;
+        });
+        assert!(!state.on_pane_update(&hidden));
+        assert_eq!(state.geometry_reasserts, 0);
+        // Reopened: floating and focused, the rising edge re-asserts once
+        // and the picker becomes visible.
+        let shown = own_pane_update(|p| {
+            p.is_floating = true;
+            p.is_focused = true;
+            p.pane_columns = 100;
+            p.pane_rows = 30;
+        });
+        assert!(state.on_pane_update(&shown));
+        assert_eq!(state.geometry_reasserts, 1);
+        assert!(state.vis.visible);
+    }
+
+    #[test]
+    fn deleting_from_an_empty_query_keeps_the_selection() {
+        let backspace = KeyWithModifier::new(BareKey::Backspace);
+        let ctrl_w = KeyWithModifier::new(BareKey::Char('w')).with_ctrl_modifier();
+        let ctrl_u = KeyWithModifier::new(BareKey::Char('u')).with_ctrl_modifier();
+        let mut state = state_with_tabs(&["active", "alpha", "beta", "gamma"]);
+        state.refresh_scores();
+        state.move_selection(Direction::Down);
+        for key in [&backspace, &ctrl_w, &ctrl_u] {
+            assert!(!state.handle_key(key)); // nothing changed, no re-render
+            assert_eq!(state.selected, 1);
+            assert!(state.selection_moved);
+        }
+        // A real deletion rebuilds the list and starts at the top again.
+        state.query = "al".to_string();
+        assert!(state.handle_key(&backspace));
+        assert_eq!(state.query, "a");
+        assert_eq!(state.selected, 0);
+        assert!(!state.selection_moved);
+    }
+
+    #[test]
+    fn delete_word_backward_takes_the_last_word_and_its_gap() {
+        for (before, after) in [
+            ("foo bar", "foo "),
+            ("foo bar  ", "foo "),
+            ("foo", ""),
+            ("  ", ""),
+            ("", ""),
+        ] {
+            let mut query = before.to_string();
+            delete_word_backward(&mut query);
+            assert_eq!(query, after, "{before:?}");
+        }
+    }
+
+    #[test]
+    fn empty_list_message_names_the_reason() {
+        let render = |state: &mut State| {
+            let mut out = String::new();
+            state.render_box(&mut out, BoxPlacement::centered(20, 60, &state.size));
+            out
+        };
+        // A single tab is the header, so the empty query lists nothing.
+        let mut state = state_with_tabs(&["only"]);
+        state.refresh_scores();
+        assert!(render(&mut state).contains("no other tabs"));
+        state.query = "zzz".to_string();
+        state.refresh_scores();
+        assert!(render(&mut state).contains("no matches"));
+        // Before the first TabUpdate the list is unknown: no message at all.
+        state.tabs_received = false;
+        assert!(!render(&mut state).contains("no "));
+    }
+
+    #[test]
+    fn geometry_reassert_budget_bounds_retries() {
+        let mut state = State::default(); // target 60×20
+        let tab = TabInfo {
+            viewport_columns: 100,
+            viewport_rows: 30,
+            ..TabInfo::default()
+        };
+        state.tabs.push(TabEntry {
+            haystack: haystack_for(&tab.name),
+            chars: Vec::new(),
+            info: Rc::new(tab),
+        });
+        // Stuck off-target in either dimension (e.g. fullscreen): a few
+        // re-asserts, then quiet, so Zellij 0.46's report after each resize
+        // cannot loop. Only the target size in both dimensions refills the
+        // budget, with nothing to do.
+        for (cols, rows) in [(100, 30), (61, 20), (60, 25)] {
+            for _ in 0..MAX_GEOMETRY_REASSERTS {
+                assert!(state.take_reassert(false, 0, cols, rows), "{cols}x{rows}");
+            }
+            assert!(!state.take_reassert(false, 0, cols, rows), "{cols}x{rows}");
+            assert!(!state.take_reassert(false, 0, 60, 20));
+        }
+        // A reopen always re-asserts and refills the budget.
+        for _ in 0..5 {
+            state.take_reassert(false, 0, 100, 30);
+        }
+        assert!(state.take_reassert(true, 0, 30, 15));
+        assert_eq!(state.geometry_reasserts, 1);
+    }
+
     #[test]
     fn search_ranks_fuzzy_matches_above_typo_matches() {
         let mut state = state_with_tabs(&["active", "backend", "frontend", "notes"]);
@@ -2097,21 +2932,54 @@ mod tests {
     }
 
     #[test]
+    fn draw_fills_the_pane_and_ends_without_a_newline() {
+        let draw = |state: &mut State, rows, cols| {
+            let mut out = String::new();
+            state.draw(&mut out, rows, cols);
+            out
+        };
+        let mut state = state_with_tabs(&["active", "alpha"]);
+        state.refresh_scores();
+        // Pane larger than the 60×20 box: blank rows above and below it,
+        // every row pane-wide, and no newline after the last row, which
+        // would scroll the top border out of the pane.
+        state.ready = true;
+        let shown = draw(&mut state, 24, 80);
+        let lines: Vec<&str> = shown.lines().collect();
+        assert_eq!(lines.len(), 24);
+        assert!(lines.iter().all(|line| visible_len(line) == 80));
+        assert!(!shown.ends_with('\n'));
+        assert_eq!(lines[1].trim(), "");
+        assert!(lines[2].contains('╭') && lines[21].contains('╰'));
+        assert_eq!(lines[22].trim(), "");
+        assert!(state.list_area.is_some());
+        // Before the permission is granted: blank rows only, no list area.
+        state.ready = false;
+        let blank = draw(&mut state, 5, 30);
+        assert_eq!(blank, vec![" ".repeat(30); 5].join("\n"));
+        assert!(state.list_area.is_none());
+    }
+
+    #[test]
     fn rendered_rows_are_exactly_one_pane_wide() {
         let mut state = state_with_tabs(&[
-            "aktiv",
+            "active",
             "backend",
             "日本語のタブ",
             "🚀 deploy",
             "a-very-long-tab-name-that-does-not-fit-into-the-box-at-all-really",
         ]);
-        let mut bell = (*state.tabs[1].info).clone();
-        bell.has_bell_notification = true;
-        state.tabs[1].info = Rc::new(bell);
-        state.timers.bell_blink_on = true;
+        // An agent waiting for you (a blinking alert row that leads the
+        // list), a working, a failed and a muted tab.
+        set_status(&mut state, 1, AttentionStatus::NeedsYou);
+        state.calling.insert(1);
+        set_status(&mut state, 2, AttentionStatus::Working);
+        set_status(&mut state, 3, AttentionStatus::Failed);
+        set_tab(&mut state, 4, |t| t.attention.muted = true);
+        state.timers.blink_on = true;
 
         // Pane larger than the 60×20 box: padding on every side, wide
-        // chars, a selected bell row, a truncated name.
+        // chars, attention markers, a selected alert row, a truncated name.
         state.refresh_scores();
         let mut out = String::new();
         state.render_box(&mut out, BoxPlacement::centered(24, 80, &state.size));
@@ -2121,6 +2989,12 @@ mod tests {
             assert_eq!(visible_len(line), 80, "{line:?}");
         }
         assert!(out.contains('…'));
+        for marker in ['●', '◐', '✗', '⊘'] {
+            assert!(out.contains(marker), "missing marker {marker}");
+        }
+        assert!(out.contains(&format!("{BOLD}✗{RESET}"))); // urgent: bold
+        assert!(out.contains(&format!("{DIM}⊘{RESET}"))); // muted: dim
+
         // vpad_top 2 + top border, prompt, separator, header, separator.
         assert_eq!(
             state.list_area,
@@ -2132,12 +3006,12 @@ mod tests {
             })
         );
 
-        // Bell row with match highlights keeps every row pane-wide too.
+        // Alert row with match highlights keeps every row pane-wide too.
         state.query = "a".to_string();
         state.refresh_scores();
         let mut out = String::new();
         state.render_box(&mut out, BoxPlacement::centered(24, 80, &state.size));
-        assert!(out.contains(BELL_RESTORE));
+        assert!(out.contains(ALERT_RESTORE));
         assert!(out.lines().all(|line| visible_len(line) == 80));
 
         // Pane smaller than the box: the box shrinks, rows stay pane-wide.
@@ -2151,16 +3025,5 @@ mod tests {
         state.render_box(&mut out, BoxPlacement::centered(3, 80, &state.size));
         assert_eq!(out.lines().count(), 3);
         assert!(state.list_area.is_none());
-
-        // No matches, and "list not yet known" before the first TabUpdate.
-        state.query = "zzz".to_string();
-        state.refresh_scores();
-        let mut out = String::new();
-        state.render_box(&mut out, BoxPlacement::centered(20, 60, &state.size));
-        assert!(out.contains("no matches"));
-        state.tabs_received = false;
-        let mut out = String::new();
-        state.render_box(&mut out, BoxPlacement::centered(20, 60, &state.size));
-        assert!(!out.contains("no "));
     }
 }

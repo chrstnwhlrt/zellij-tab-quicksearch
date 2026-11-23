@@ -25,7 +25,7 @@
 
       # Overlay is system-agnostic — must live outside eachDefaultSystem.
       overlay = final: _prev: {
-        ${pname} = self.packages.${final.system}.default;
+        ${pname} = self.packages.${final.stdenv.hostPlatform.system}.default;
       };
     in
     flake-utils.lib.eachDefaultSystem
@@ -98,8 +98,9 @@
             longDescription = ''
               A Zellij plugin providing a floating, fuzzy-matching, typo-tolerant
               tab picker.
-              Features frequency-based ordering, instant jump via digit keys,
-              theme-aware rendering, and graceful behaviour on narrow panes.
+              It features per-tab attention markers (Zellij 0.46+),
+              frequency-based ordering, instant jump via digit keys,
+              theme-aware rendering and graceful behaviour on narrow panes.
             '';
             license = licenses.mit;
             platforms = platforms.all;
