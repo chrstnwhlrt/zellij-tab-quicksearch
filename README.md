@@ -22,7 +22,7 @@ A floating, fuzzy-matching tab picker for [Zellij](https://zellij.dev): open it 
 - **Wide-character aware**: tab names with emoji or CJK characters are measured by display width ([unicode-width](https://crates.io/crates/unicode-width)), so the frame and truncation stay aligned.
 - **Frameless**: `set_pane_borderless` removes the default Zellij frame for a clean modal look.
 - **Configurable size**: `max_cols` and `max_rows` for the floating pane, settable via the plugin alias.
-- **Query auto-clear**: fresh query on every open.
+- **Esc keeps your place**: closing with `Esc` clears the query, but a selection you moved, or reached by typing, stays on its tab for the next open. After a jump the next open starts at the top of the list.
 - **Graceful on tiny panes**: degrades to blank rather than breaking the frame.
 
 ## Keybindings (inside the picker)
@@ -37,9 +37,9 @@ A floating, fuzzy-matching tab picker for [Zellij](https://zellij.dev): open it 
 | `Backspace`                        | Delete the last character                                           |
 | `Ctrl-w`                           | Delete the previous word                                            |
 | `Ctrl-u`                           | Clear the entire query                                              |
-| `Esc` / `Ctrl-c` / `Ctrl-g`        | Close the picker without switching                                  |
+| `Esc` / `Ctrl-c` / `Ctrl-g`        | Close without switching; the query is cleared, a selection you made stays on its tab |
 | Mouse wheel                        | Move selection one row per wheel step (no wrap-around)              |
-| Left click                         | Select the row; click the selected row again to switch (the first row starts selected, so one click there switches) |
+| Left click                         | Select the row; click the selected row again to switch (the row that starts selected, the first one or the one `Esc` kept, switches with one click) |
 
 ## Installation
 
@@ -137,9 +137,9 @@ plugins {
 | `max_cols` | 60      | Box width in cells (minimum 20)  |
 | `max_rows` | 20      | Box height in cells (minimum 4)  |
 
-The plugin asks Zellij to size the floating pane to exactly `max_cols` x `max_rows`, and Zellij centres it in the viewport. If the pane is briefly larger during the initial layout, the inner box stays capped at those values and is centred inside the pane. Values below 20 columns or 4 rows are clamped; a *pane* smaller than that renders blank rather than breaking the frame.
+The plugin asks Zellij to size the floating pane to exactly `max_cols` x `max_rows`, and Zellij centres it in the viewport. If the pane stays larger (for example made fullscreen), the inner box stays capped at those values and is centred inside the pane. Values below 20 columns or 4 rows are clamped; a *pane* smaller than that renders blank rather than breaking the frame.
 
-> **Note**: Zellij re-inserts the floating pane at its default geometry (half the viewport, with a frame) on every open, because the plugin only hides itself when closed and `LaunchOrFocusPlugin` adds it back as if it were new. The plugin re-asserts its size and borderless state as soon as Zellij reports the pane back in the floating layer, so each open may briefly show the pane at Zellij's default size before the target geometry takes effect. On a terminal too small for the configured size the pane is clamped to the viewport and the box shrinks with it; once the terminal grows again the target size is restored. The plugin re-sends the size at most three times until the pane reaches it, since Zellij 0.46 answers every resize with a fresh pane report.
+> **Note**: Zellij re-inserts the floating pane at its default geometry (half the viewport) on every open, because the plugin only hides itself when closed and `LaunchOrFocusPlugin` adds it back as if it were new. As soon as Zellij renders the plugin at that larger size, the plugin requests its own size, which Zellij usually applies before the next screen update. Until the pane has shrunk, the plugin draws the box in the pane's top-left corner at exactly the box size: Zellij keeps a pane's content when it shrinks the pane and re-wraps every line that no longer fits, so a centred box would show up scrambled until the next render. When Zellij then reports the pane back in the floating layer, the plugin re-asserts size and borderless state once more. On a terminal too small for the configured size the pane is clamped to the viewport and the box shrinks with it; once the terminal grows again the target size is restored. The plugin re-sends the size at most three times until the pane reaches it, since Zellij 0.46 answers every resize with a fresh pane report.
 
 ## Development
 

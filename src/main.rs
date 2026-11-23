@@ -34,9 +34,8 @@ const ALERT_RESTORE: &str = "\u{1b}[0;7;38;5;250m";
 // Static padding to avoid `" ".repeat(n)` allocations in hot paths.
 const PAD_SPACES: &str = "                                                                                                                                ";
 
-/// Writes exactly `n` spaces into `out`, even when `n > PAD_SPACES.len()`.
-/// Important for ultrawide terminals so lead/trail/blank rows are long
-/// enough — otherwise they would render as transparent cells.
+/// Writes exactly `n` spaces into `out`, even when `n > PAD_SPACES.len()`
+/// (ultrawide terminals), so lead, trail and blank rows keep their width.
 fn push_pad(out: &mut String, n: usize) {
     let mut remaining = n;
     while remaining >= PAD_SPACES.len() {
@@ -91,6 +90,14 @@ const APPROX_MAX_NAME_CHARS: usize = 512;
 // at its target size (or a reopen), see `State::take_reassert`. Three
 // covers the load/relayout race with room to spare.
 const MAX_GEOMETRY_REASSERTS: u8 = 3;
+
+// How long a pending resize may still land once the re-assert budget is
+// spent before the box is centred in the larger pane (see
+// `State::on_resize_timeout`). Reports can predate the first request:
+// when Zellij 0.45 moves the picker between tabs, up to six arrived before
+// it in tests, and giving up on those at once would draw the centred box
+// into a pane that is already shrinking.
+const RESIZE_TIMEOUT: f64 = 0.5;
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -220,7 +227,9 @@ fn calls_for_you(calling: &BTreeSet<usize>, tab: &TabInfo) -> bool {
 
 /// Configured box dimensions in cells. Sent both as the pane request size
 /// to `change_floating_panes_coordinates` and used as the render-box cap:
-/// the plugin box is `min(render_area, size)`, centred inside the pane.
+/// the plugin box is `min(render_area, size)`, centred inside the pane, or
+/// in its top-left corner while a resize is pending (see
+/// `State::placement`).
 struct SizeCfg {
     cols: usize,
     rows: usize,
@@ -305,7 +314,7 @@ struct ListArea {
 
 /// What a pending host timer is for. zellij-tile has no cancel API and
 /// `Event::Timer` carries no id, only the elapsed time, so the plugin keeps
-/// its own bookkeeping to tell the two timer sources apart.
+/// its own bookkeeping to tell the timer sources apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimerKind {
     /// Blink tick for the rows that call for you. At most one is ever in
@@ -313,6 +322,9 @@ enum TimerKind {
     Blink,
     /// Quickjump timeout. Only the newest generation may act.
     Jump { generation: u32 },
+    /// Last chance for a pending resize (see `RESIZE_TIMEOUT`); void once
+    /// a newer size request went out (`OwnPane::resize_generation`).
+    ResizeTimeout { generation: u32 },
 }
 
 #[derive(Default)]
@@ -371,6 +383,31 @@ impl Timers {
     }
 }
 
+/// What the plugin knows about its own pane, for the geometry it asks
+/// Zellij for and the pane count of the header.
+#[derive(Default)]
+struct OwnPane {
+    /// From the last `PaneUpdate`: whether the pane counts among its tab's
+    /// panes (shown and selectable). `None` before the first one, which
+    /// reads as counted: the picker is shown when it loads.
+    counted: Option<bool>,
+    /// Whether the active tab's pane counts in `State::tabs` include the
+    /// pane, which the header leaves out (see `State::on_tab_update`).
+    counted_in_tabs: bool,
+    /// Whether the pane was floating when last shown.
+    floating: bool,
+    /// True from a resize request until a render sees the pane no larger
+    /// than its target, a report shows it tiled or no longer larger, or the
+    /// pane stays larger past `RESIZE_TIMEOUT`; meanwhile the box is drawn
+    /// top-left (see `State::placement`).
+    resize_pending: bool,
+    /// Bumped by every size request (see `TimerKind::ResizeTimeout`).
+    resize_generation: u32,
+    /// Content size (rows, cols) of the last render (see
+    /// `State::resize_on_new_size`).
+    rendered: (usize, usize),
+}
+
 #[derive(Default)]
 struct State {
     tabs: Vec<TabEntry>,
@@ -379,9 +416,10 @@ struct State {
     tabs_received: bool,
     query: String,
     selected: usize,
-    /// True once the user moved the selection in this open cycle (keys,
-    /// wheel, click). Such a selection stays on its tab when an update
-    /// reorders the list; the initial one stays on the first row.
+    /// True once the user moved the selection (keys, wheel, click), or when
+    /// Esc kept a chosen one for the next open (see `close`). Such a
+    /// selection stays on its tab when an update reorders the list; the
+    /// initial one stays on the first row.
     selection_moved: bool,
     scroll_offset: usize,
     matcher: Matcher,
@@ -408,6 +446,8 @@ struct State {
     /// Positions of the tabs with a pane that calls for you, from the last
     /// `PaneUpdate` (see `calls_for_you`).
     calling: BTreeSet<usize>,
+    /// The picker's own pane: geometry requests and the header's count.
+    own: OwnPane,
 }
 
 register_plugin!(State);
@@ -422,14 +462,15 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
             EventType::TabUpdate,
             // `PaneUpdate`: geometry re-assert (reopen, layout resets), the
-            // `pane_focused` visibility indicator (see `Visibility`) and the
-            // tabs that call for you (see `pane_calls_for_you`).
+            // `pane_focused` visibility indicator (see `Visibility`), the
+            // tabs that call for you (see `pane_calls_for_you`) and the state
+            // of the picker's own pane (see `OwnPane`).
             EventType::PaneUpdate,
             EventType::Key,
             // `Mouse`: click to select / confirm, wheel to move the selection.
             EventType::Mouse,
-            // `Timer`: quickjump buffer + blink loop of the rows that call
-            // for you.
+            // `Timer`: quickjump buffer, blink loop of the rows that call
+            // for you and the resize timeout (see `RESIZE_TIMEOUT`).
             EventType::Timer,
             // `Visible`: the host's visibility signal, where it sends one.
             EventType::Visible,
@@ -566,13 +607,15 @@ fn append_horizontal_border(out: &mut String, left: char, right: char, cols: usi
 }
 
 /// Where the box sits inside the pane: `rows` × `cols` cells, starting at
-/// column `hpad` below `vpad_top` blank rows, in a pane `outer_cols` wide.
+/// column `hpad` below `vpad_top` blank rows and above `vpad_bottom` ones,
+/// in rows `outer_cols` wide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BoxPlacement {
     rows: usize,
     cols: usize,
     hpad: usize,
     vpad_top: usize,
+    vpad_bottom: usize,
     outer_cols: usize,
 }
 
@@ -581,20 +624,29 @@ impl BoxPlacement {
     fn centered(rows: usize, cols: usize, size: &SizeCfg) -> Self {
         let box_cols = cols.min(size.cols);
         let box_rows = rows.min(size.rows);
+        let vpad_top = rows.saturating_sub(box_rows) / 2;
         Self {
             rows: box_rows,
             cols: box_cols,
             hpad: cols.saturating_sub(box_cols) / 2,
-            vpad_top: rows.saturating_sub(box_rows) / 2,
+            vpad_top,
+            vpad_bottom: rows.saturating_sub(box_rows).saturating_sub(vpad_top),
             outer_cols: cols,
         }
     }
 
-    /// Blank pane rows below the box.
-    fn vpad_bottom(self, pane_rows: usize) -> usize {
-        pane_rows
-            .saturating_sub(self.rows)
-            .saturating_sub(self.vpad_top)
+    /// The same box in the top-left corner, every row exactly box-wide and
+    /// no rows below it: nothing beyond the box for Zellij to wrap when it
+    /// shrinks the pane to the box (see `State::placement`).
+    fn top_left(rows: usize, cols: usize, size: &SizeCfg) -> Self {
+        let centered = Self::centered(rows, cols, size);
+        Self {
+            hpad: 0,
+            vpad_top: 0,
+            vpad_bottom: 0,
+            outer_cols: centered.cols,
+            ..centered
+        }
     }
 
     fn row_frame(self) -> RowFrame {
@@ -608,8 +660,8 @@ impl BoxPlacement {
 
 /// Horizontal layout shared by every box row: `hpad` blank cells, the box
 /// (`cols` wide, six of which are frame and padding), then `trail` blank
-/// cells up to the pane's right edge — every row is exactly one pane wide,
-/// so no cell is left transparent.
+/// cells up to `BoxPlacement::outer_cols`: the pane's right edge, or the
+/// box's own while a resize is pending (see `BoxPlacement::top_left`).
 #[derive(Clone, Copy)]
 struct RowFrame {
     hpad: usize,
@@ -643,21 +695,18 @@ impl RowFrame {
 impl State {
     /// Draws the whole pane into `out` as `render` prints it: `rows` lines of
     /// exactly `cols` cells, blank until the permission is granted, with no
-    /// newline after the last line.
+    /// newline after the last line; while a resize is pending, only the
+    /// box's own lines and cells (see `placement`). A new size larger than
+    /// the box first requests the target size (see `resize_on_new_size`).
     fn draw(&mut self, out: &mut String, rows: usize, cols: usize) {
+        self.resize_on_new_size(rows, cols);
         if self.ready {
-            // Box capped at the configured size, centred in the plugin area.
-            // When `change_floating_panes_coordinates` has taken effect the
-            // render area equals the box → no padding. Otherwise (the frame
-            // between (re)open and the resize taking effect) the box is
-            // rendered compact with padding around it — cosmetically
-            // imperfect but stable.
-            let place = BoxPlacement::centered(rows, cols, &self.size);
+            let place = self.placement(rows, cols);
             for _ in 0..place.vpad_top {
                 append_padded(out, cols, "");
             }
             self.render_box(out, place);
-            for _ in 0..place.vpad_bottom(rows) {
+            for _ in 0..place.vpad_bottom {
                 append_padded(out, cols, "");
             }
         } else {
@@ -672,6 +721,52 @@ impl State {
         // row — the top line (`╭───╮`) disappears.
         if out.ends_with('\n') {
             out.pop();
+        }
+    }
+
+    /// Zellij changes a floating pane's geometry before it reports it: a
+    /// reopen, or `move_to_focused_tab` taking the open picker into another
+    /// tab, puts the pane back at its default geometry (half the viewport,
+    /// see `on_pane_update`), resizes the plugin and only then sends the
+    /// `PaneUpdate`. So a render larger than the box at a new size requests
+    /// the target size right here, ahead of that `PaneUpdate` and mostly
+    /// before Zellij first updates the screen. It never fires for a hidden
+    /// pane, which a size request would show again: Zellij leaves a hidden
+    /// pane's size alone, and a resize requested before Esc can only take
+    /// it to the box size. It fires once per new size, so it cannot loop by
+    /// itself. (A reopen smaller than the box, on a small terminal, is left
+    /// to the `PaneUpdate`.) Plugin commands may run inside `render`; this
+    /// one leaves before anything is printed.
+    fn resize_on_new_size(&mut self, rows: usize, cols: usize) {
+        let previous = std::mem::replace(&mut self.own.rendered, (rows, cols));
+        if self.own.floating && self.larger_than_box(rows, cols) && (rows, cols) != previous {
+            self.resize_pane();
+        }
+    }
+
+    /// Whether a `rows` × `cols` pane is larger than the box in either
+    /// dimension.
+    fn larger_than_box(&self, rows: usize, cols: usize) -> bool {
+        rows > self.size.rows || cols > self.size.cols
+    }
+
+    /// Where the box goes in a `rows` × `cols` pane: capped at the
+    /// configured size and centred, where padding fills the rest of a pane
+    /// that stays larger than the box (e.g. made fullscreen). While a resize
+    /// to the box is pending, a larger pane gets the box in its top-left
+    /// corner instead, with nothing beside or below it: Zellij keeps a
+    /// pane's content when it shrinks the pane and re-wraps every line that
+    /// no longer fits, so a centred box would turn into garbage until the
+    /// next render, whereas this one is already the finished picture. A
+    /// pane no larger than the box ends a pending resize.
+    fn placement(&mut self, rows: usize, cols: usize) -> BoxPlacement {
+        if !self.larger_than_box(rows, cols) {
+            self.own.resize_pending = false;
+        }
+        if self.own.resize_pending {
+            BoxPlacement::top_left(rows, cols, &self.size)
+        } else {
+            BoxPlacement::centered(rows, cols, &self.size)
         }
     }
 
@@ -786,7 +881,10 @@ impl State {
         if let Some(t) = &active_tab {
             if list_rows >= 2 {
                 content.clear();
-                render_active_row(&mut content, t, content_width);
+                // The header counts the tab's panes without the picker.
+                let panes = (t.selectable_tiled_panes_count + t.selectable_floating_panes_count)
+                    .saturating_sub(usize::from(self.own.counted_in_tabs));
+                render_active_row(&mut content, t, panes, content_width);
                 frame.wrapped(out, &content, HighlightStyle::default());
                 frame.border(out, '├', '┤');
                 list_rows -= 2;
@@ -834,6 +932,10 @@ impl State {
         }
         let kept = self.moved_selection();
         self.tabs_received = true;
+        // Zellij reports panes before tabs, so the last `PaneUpdate` tells
+        // whether this snapshot counts the picker: it does while the picker
+        // is shown, not while Zellij 0.46 reports to it hidden.
+        self.own.counted_in_tabs = self.own.counted.unwrap_or(true);
         // Cache the fuzzy haystacks once per `TabUpdate` (not per keystroke
         // × tab).
         self.tabs = new_tabs
@@ -871,12 +973,14 @@ impl State {
     }
 
     /// Puts the selection back on tab `kept` (a `tab_id` from
-    /// `moved_selection`) if the rebuilt list still holds it.
-    fn restore_selection(&mut self, kept: Option<usize>) {
-        if let Some(index) = kept.and_then(|id| self.scored.iter().position(|s| s.tab.tab_id == id))
-        {
+    /// `moved_selection`) if the rebuilt list still holds it, and returns
+    /// whether it did.
+    fn restore_selection(&mut self, kept: Option<usize>) -> bool {
+        let found = kept.and_then(|id| self.scored.iter().position(|s| s.tab.tab_id == id));
+        if let Some(index) = found {
             self.selected = index;
         }
+        found.is_some()
     }
 
     /// `PaneUpdate`: records which tabs call for you, derives the
@@ -899,27 +1003,51 @@ impl State {
         let Some((tab_position, pane)) = own_pane else {
             // Not in the manifest (e.g. mid-move): treat as unfocused.
             self.vis.pane_focused = false;
+            self.own.counted = Some(false);
             return self.recompute_visibility() || calling_changed;
         };
-        let pane_focused_now = pane.is_floating && !pane.is_suppressed && pane.is_focused;
+        let shown = !pane.is_suppressed;
+        let pane_focused_now = pane.is_floating && shown && pane.is_focused;
         // Every reopen re-inserts the floating pane at Zellij's default
         // geometry (half the viewport, with a frame content offset):
         // `hide_self` takes it out of the floating layer and
-        // `LaunchOrFocusPlugin` adds it back as if new. The rising edge of
-        // `pane_focused` is the first signal that the pane is back (a hidden
-        // plugin gets no updates before 0.46, and a suppressed pane is never
-        // focused), so re-assert unconditionally there. Only a floating pane
-        // is re-asserted: Zellij reports a hidden (suppressed) pane as not
-        // floating, and a coordinates change would move it back into the
-        // floating layer, i.e. show the closed picker again.
+        // `LaunchOrFocusPlugin` adds it back as if new. The first render at
+        // that size already asks for the target (`resize_on_new_size`); the
+        // first `PaneUpdate` that shows the pane back is the rising edge of
+        // `pane_focused` (a hidden plugin gets no updates before 0.46, and a
+        // suppressed pane is never focused), so re-assert unconditionally
+        // there as well. Only a floating pane is re-asserted: Zellij reports
+        // a hidden (suppressed) pane as not floating, and a coordinates
+        // change would move it back into the floating layer, i.e. show the
+        // closed picker again.
         let reappeared = pane_focused_now && !self.vis.pane_focused;
-        if pane.is_floating
-            && self.take_reassert(reappeared, tab_position, pane.pane_columns, pane.pane_rows)
-        {
-            self.resize_pane();
+        let was_pending = self.own.resize_pending;
+        if pane.is_floating {
+            if self.take_reassert(reappeared, tab_position, pane.pane_columns, pane.pane_rows) {
+                self.resize_pane();
+            } else if self.own.resize_pending
+                && self.larger_than_box(pane.pane_rows, pane.pane_columns)
+            {
+                // The budget is spent with the pane still larger, but this
+                // report may predate the first request: give it a moment.
+                self.arm_resize_timeout();
+            } else {
+                // On target, or no longer larger: draw centred again.
+                self.own.resize_pending = false;
+            }
+        } else if shown {
+            // A tiled picker keeps the size its layout gives it.
+            self.own.resize_pending = false;
         }
+        // Dropping the request moves the box back to the centre, which needs
+        // a render of its own when the pane keeps its size.
+        let recentred = was_pending && !self.own.resize_pending;
+        if shown {
+            self.own.floating = pane.is_floating;
+        }
+        self.own.counted = Some(shown && pane.is_selectable);
         self.vis.pane_focused = pane_focused_now;
-        self.recompute_visibility() || calling_changed
+        self.recompute_visibility() || calling_changed || recentred
     }
 
     /// Records which tabs call for you (see `pane_calls_for_you`). On a
@@ -995,13 +1123,39 @@ impl State {
         true
     }
 
-    /// `Timer`: dispatches to the quickjump or the blink handler.
+    /// `Timer`: dispatches to the quickjump, blink or resize timeout handler.
     fn on_timer(&mut self, elapsed: f64) -> bool {
         match self.timers.resolve(elapsed) {
             Some(TimerKind::Jump { generation }) => self.on_jump_timer(generation),
             Some(TimerKind::Blink) => self.on_blink_timer(),
+            Some(TimerKind::ResizeTimeout { generation }) => self.on_resize_timeout(generation),
             None => false,
         }
+    }
+
+    /// Arms the last chance for the pending resize, once per request.
+    fn arm_resize_timeout(&mut self) {
+        let kind = TimerKind::ResizeTimeout {
+            generation: self.own.resize_generation,
+        };
+        if !self.timers.pending.iter().any(|(k, _)| *k == kind) {
+            self.arm_timer(kind, RESIZE_TIMEOUT);
+        }
+    }
+
+    /// `RESIZE_TIMEOUT` after the budget ran out: unless a render has seen
+    /// the pane at its target since, or a newer request went out, the pane
+    /// stays larger (e.g. made fullscreen), so the box moves to its centre.
+    fn on_resize_timeout(&mut self, generation: u32) -> bool {
+        let (rows, cols) = self.own.rendered;
+        if generation != self.own.resize_generation
+            || !self.own.resize_pending
+            || !self.larger_than_box(rows, cols)
+        {
+            return false;
+        }
+        self.own.resize_pending = false;
+        true
     }
 
     /// Quickjump timeout after the (D-1)-th digit: jump if the query is
@@ -1150,23 +1304,47 @@ impl State {
         moved
     }
 
-    /// Switches to the selected tab, if there is one, and closes the
-    /// picker.
+    /// Switches to the selected tab, if there is one, and closes the picker
+    /// with a fresh list for the next open.
     fn jump_to_selected(&mut self) {
         if let Some(s) = self.scored.get(self.selected) {
-            let tab_id = s.tab.tab_id;
+            let (tab_id, position) = (s.tab.tab_id, s.tab.position);
             // pos is usize; both +1 and the u32 conversion are fallible.
-            if let Some(p) = s
-                .tab
-                .position
-                .checked_add(1)
-                .and_then(|n| u32::try_from(n).ok())
-            {
+            if let Some(p) = position.checked_add(1).and_then(|n| u32::try_from(n).ok()) {
                 switch_tab_to(p);
                 self.record_access(tab_id);
+                self.record_switch(position);
             }
         }
+        self.reset_list();
         self.hide();
+    }
+
+    /// Applies a switch to the tab at `position` to the local snapshot.
+    /// Zellij reports only to the plugins of the active tab, so the hidden
+    /// picker, left behind in the old tab, hears of the switch only once it
+    /// is open again, and the first render of that open would show the old
+    /// active tab. No tab counts the picker's pane any more: it stays hidden
+    /// in the old one.
+    fn record_switch(&mut self, position: usize) {
+        let counted = std::mem::take(&mut self.own.counted_in_tabs);
+        let floating = self.own.floating;
+        for e in &mut self.tabs {
+            let active = e.info.position == position;
+            if e.info.active == active {
+                continue;
+            }
+            let info = Rc::make_mut(&mut e.info);
+            if info.active && counted {
+                let count = if floating {
+                    &mut info.selectable_floating_panes_count
+                } else {
+                    &mut info.selectable_tiled_panes_count
+                };
+                *count = count.saturating_sub(1);
+            }
+            info.active = active;
+        }
     }
 
     /// Sends the target geometry to Zellij. `borderless` travels inside the
@@ -1175,7 +1353,9 @@ impl State {
     /// borderless flag right after resizing). The explicit
     /// `set_pane_borderless` additionally covers a pane that is not floating
     /// (e.g. launched with `floating false`).
-    fn resize_pane(&self) {
+    fn resize_pane(&mut self) {
+        self.own.resize_pending = true;
+        self.own.resize_generation = self.own.resize_generation.wrapping_add(1);
         change_floating_panes_coordinates(vec![(
             PaneId::Plugin(self.plugin_id),
             FloatingPaneCoordinates {
@@ -1188,14 +1368,41 @@ impl State {
         set_pane_borderless(PaneId::Plugin(self.plugin_id), true);
     }
 
-    fn hide(&mut self) {
-        // Clear the query for the next open cycle; plugin instance and
-        // counts persist.
+    /// Esc, Ctrl-c, Ctrl-g: closes the picker without switching. The query
+    /// is cleared, but a selection the user made, by moving it or by typing
+    /// the query that put it there, stays on its tab for the next open, in
+    /// the same scroll position as far as the list allows; an untouched one
+    /// stays on the first row.
+    fn close(&mut self) {
+        let chosen = self.selection_moved || !self.query.is_empty();
+        let kept = self
+            .scored
+            .get(self.selected)
+            .filter(|_| chosen)
+            .map(|s| s.tab.tab_id);
+        let scroll_offset = self.scroll_offset;
+        self.reset_list();
+        self.selection_moved = self.restore_selection(kept);
+        if self.selection_moved {
+            // The next render scrolls as little as keeps the row in view.
+            self.scroll_offset = scroll_offset;
+        }
+        self.hide();
+    }
+
+    /// Clears the query and puts the selection on the first row of the
+    /// full list, as a jump leaves the picker for its next open.
+    fn reset_list(&mut self) {
         self.query.clear();
         self.selected = 0;
         self.selection_moved = false;
         self.scroll_offset = 0;
         self.refresh_scores();
+    }
+
+    /// Hides the picker; the plugin instance, its list and the counts
+    /// persist.
+    fn hide(&mut self) {
         // Mark invisible locally right away: `PaneUpdate`/`TabUpdate` would
         // do the same, but before Zellij 0.46 a hidden plugin never receives
         // them.
@@ -1261,8 +1468,8 @@ impl State {
         let max = digit_count(self.tabs.len());
         if cur >= max {
             // Final digit reached — position is unambiguous, jump
-            // immediately. On success `try_instant_jump` calls `hide()`
-            // which clears state, so we return without falling through
+            // immediately. On success `try_instant_jump` has reset the list
+            // and hidden the picker, so we return without falling through
             // to `query_changed()`.
             if let Ok(pos) = self.query.parse::<u32>() {
                 if self.try_instant_jump(pos) {
@@ -1293,10 +1500,12 @@ impl State {
             return false;
         };
         if !e.info.active {
-            let tab_id = e.info.tab_id;
+            let (tab_id, position) = (e.info.tab_id, e.info.position);
             switch_tab_to(pos);
             self.record_access(tab_id);
+            self.record_switch(position);
         }
+        self.reset_list();
         self.hide();
         true
     }
@@ -1306,16 +1515,17 @@ impl State {
         let has_alt = key.key_modifiers.contains(&KeyModifier::Alt);
 
         // Every close path returns `true`: one more render after `hide()`
-        // leaves the cleared picker in the pane's stored grid (Zellij routes
-        // render output to suppressed panes too), so a reopen never flashes
-        // the previous query even before the first update arrives.
+        // leaves the picker as the next open shows it in the pane's stored
+        // grid (Zellij routes render output to suppressed panes too), so a
+        // reopen never flashes the previous query even before the first
+        // update arrives.
         match key.bare_key {
             BareKey::Esc => {
-                self.hide();
+                self.close();
                 true
             }
             BareKey::Char('c' | 'g') if has_ctrl => {
-                self.hide();
+                self.close();
                 true
             }
             BareKey::Enter => {
@@ -1502,9 +1712,8 @@ impl State {
     }
 }
 
-fn render_active_row(out: &mut String, tab: &TabInfo, cols: usize) {
-    let raw_panes = tab.selectable_tiled_panes_count + tab.selectable_floating_panes_count;
-    let panes = raw_panes.saturating_sub(1);
+/// The active-tab header: marker, name and the tab's pane count `panes`.
+fn render_active_row(out: &mut String, tab: &TabInfo, panes: usize, cols: usize) {
     // pane_str renders as "[N]" — visible width = digit_count(N) + 2.
     // Computed by formula instead of format-then-measure to skip an alloc.
     let pane_len = digit_count(panes) + 2;
@@ -2089,6 +2298,11 @@ mod tests {
             approx_match(&chars("end"), &name, 1, &mut scratch),
             Some((0, vec![4, 5, 6]))
         );
+        // A query char before the matched text is dropped, not highlighted.
+        assert_eq!(
+            approx_match(&chars("zback"), &name, 1, &mut scratch),
+            Some((1, vec![0, 1, 2, 3]))
+        );
         // Beyond the budget → no match.
         assert_eq!(approx_match(&chars("xyz"), &name, 1, &mut scratch), None);
         assert_eq!(
@@ -2188,6 +2402,13 @@ mod tests {
         // Unknown tab: no viewport information, leave alone.
         state.size.cols = 60;
         assert!(!state.geometry_needs_reassert(7, 50, 15));
+        // There too a pane larger than the target re-asserts (the target
+        // fits wherever the larger pane does), but not one only as large in
+        // one dimension and smaller in the other.
+        assert!(state.geometry_needs_reassert(7, 61, 20));
+        assert!(state.geometry_needs_reassert(7, 60, 21));
+        assert!(!state.geometry_needs_reassert(7, 60, 15));
+        assert!(!state.geometry_needs_reassert(7, 50, 20));
     }
 
     #[test]
@@ -2248,6 +2469,16 @@ mod tests {
         state.scroll_offset = 2;
         assert_eq!(state.list_index_at(5, 10), Some(2));
         assert_eq!(state.list_index_at(6, 10), None);
+        // A list longer than its area: the row below the area is no hit.
+        state.scroll_offset = 0;
+        state.list_area = Some(ListArea {
+            top: 5,
+            rows: 2,
+            left: 4,
+            width: 60,
+        });
+        assert_eq!(state.list_index_at(6, 10), Some(1));
+        assert_eq!(state.list_index_at(7, 10), None);
         // No render yet: nothing to hit.
         state.list_area = None;
         assert_eq!(state.list_index_at(5, 10), None);
@@ -2453,8 +2684,11 @@ mod tests {
             vec!["delta", "eps", "gamma", "alpha", "beta"]
         );
         assert!(state.any_listed_calls_for_you());
-        // The same report again changes nothing and needs no render.
+        // The same report again changes nothing and needs no render, and
+        // neither do the same tabs.
         assert!(!state.on_pane_update(&report));
+        let same: Vec<TabInfo> = state.tabs.iter().map(|e| (*e.info).clone()).collect();
+        assert!(!state.on_tab_update(same));
 
         // No tab status (`attention.tab_markers` off) or a muted tab: no call.
         set_status(&mut state, 4, AttentionStatus::Idle);
@@ -2543,12 +2777,13 @@ mod tests {
         }
 
         // An untouched selection stays on the first row, where gamma lands
-        // once it calls for you; so does a selection moved to beta that
-        // closing the picker or editing the query reset (Zellij 0.46 keeps
-        // sending updates to the hidden picker).
+        // once it calls for you; so does a selection moved to beta that a
+        // jump or a query edit reset (Zellij 0.46 keeps sending updates to
+        // the hidden picker).
         let untouched: fn(&mut State) = |_| {};
-        let closed: fn(&mut State) = |s| {
+        let jumped: fn(&mut State) = |s| {
             s.move_selection_by(Direction::Down, 1);
+            s.reset_list();
             s.hide();
         };
         let edited: fn(&mut State) = |s| {
@@ -2556,7 +2791,7 @@ mod tests {
             s.query_changed();
         };
         for pane_first in [true, false] {
-            for prepare in [untouched, closed, edited] {
+            for prepare in [untouched, jumped, edited] {
                 let mut state = state_with_tabs(&["active", "alpha", "beta", "gamma"]);
                 state.ready = true;
                 state.refresh_scores();
@@ -2569,17 +2804,90 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_w_and_ctrl_u_edit_the_query_while_plain_w_and_u_type() {
+    fn ctrl_w_and_ctrl_u_edit_the_query_while_plain_letters_type() {
+        // Plain c and g type as well; with Ctrl they close (see
+        // `esc_keeps_a_chosen_selection_and_a_jump_starts_at_the_top`).
         let mut state = state_with_tabs(&["active"]);
-        for c in "foo wu".chars() {
+        for c in "cog wu".chars() {
             assert!(state.handle_key(&KeyWithModifier::new(BareKey::Char(c))));
         }
-        assert_eq!(state.query, "foo wu");
+        assert_eq!(state.query, "cog wu");
         let ctrl = |c| KeyWithModifier::new(BareKey::Char(c)).with_ctrl_modifier();
         assert!(state.handle_key(&ctrl('w')));
-        assert_eq!(state.query, "foo ");
+        assert_eq!(state.query, "cog ");
         assert!(state.handle_key(&ctrl('u')));
         assert_eq!(state.query, "");
+    }
+
+    #[test]
+    fn digits_on_an_empty_query_jump_by_position() {
+        let digit = |c| KeyWithModifier::new(BareKey::Char(c));
+        let active = |state: &State| {
+            state
+                .tabs
+                .iter()
+                .find(|e| e.info.active)
+                .map(|e| e.info.name.clone())
+        };
+        // Up to nine tabs one digit is the whole number: it jumps at once,
+        // counts the visit and leaves a fresh list.
+        let names = ["t1", "t2", "t3", "t4", "t5"];
+        let mut state = state_with_tabs(&names);
+        state.ready = true;
+        state.refresh_scores();
+        assert!(state.handle_key(&digit('3')));
+        assert_eq!(active(&state).as_deref(), Some("t3"));
+        assert_eq!(state.access_counts.get(&2), Some(&1));
+        assert_eq!(state.query, "");
+        assert_eq!(listed_names(&state), vec!["t1", "t2", "t4", "t5"]);
+        // The active tab's own number only closes the picker.
+        assert!(state.handle_key(&digit('3')));
+        assert_eq!(active(&state).as_deref(), Some("t3"));
+        assert_eq!(state.access_counts.get(&2), Some(&1));
+        // A number past the last tab is a query, and so is a leading 0.
+        assert!(state.handle_key(&digit('9')));
+        assert_eq!(state.query, "9");
+        state.query.clear();
+        assert!(state.handle_key(&digit('0')));
+        assert_eq!(state.query, "0");
+
+        // From ten tabs on the first digit waits for the second, and the
+        // second completes the number.
+        let names: Vec<String> = (1..=12).map(|n| format!("t{n}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut state = state_with_tabs(&names);
+        state.ready = true;
+        state.refresh_scores();
+        assert!(state.handle_key(&digit('1')));
+        assert_eq!(state.query, "1");
+        assert_eq!(active(&state).as_deref(), Some("t1"));
+        assert!(state.handle_key(&digit('2')));
+        assert_eq!(active(&state).as_deref(), Some("t12"));
+        assert_eq!(state.query, "");
+        // Or the timeout jumps on the single digit, if still visible; the
+        // first number's timer, still due, no longer counts.
+        assert!(state.handle_key(&digit('2')));
+        state.vis.visible = true;
+        assert!(!state.on_timer(JUMP_TIMEOUT));
+        assert!(state.on_timer(JUMP_TIMEOUT));
+        assert_eq!(active(&state).as_deref(), Some("t2"));
+        // The timeout does nothing while the picker is hidden ...
+        assert!(state.handle_key(&digit('1')));
+        state.vis.visible = false;
+        assert!(!state.on_timer(JUMP_TIMEOUT));
+        assert_eq!(active(&state).as_deref(), Some("t2"));
+        // ... nor once the query is no jump buffer any more, even one that
+        // reads as a number ("1", Backspace, "05").
+        state.query.clear();
+        state.refresh_scores();
+        state.vis.visible = true;
+        let backspace = KeyWithModifier::new(BareKey::Backspace);
+        for key in [digit('1'), backspace, digit('0'), digit('5')] {
+            state.handle_key(&key);
+        }
+        assert_eq!(state.query, "05");
+        assert!(!state.on_timer(JUMP_TIMEOUT));
+        assert_eq!(active(&state).as_deref(), Some("t2"));
     }
 
     #[test]
@@ -2702,6 +3010,14 @@ mod tests {
             assert_eq!(wrap(false, true, blink_on).contains(ALERT), blink_on);
             assert_eq!(wrap(true, true, blink_on).contains(SELECTED), blink_on);
         }
+        // A lit row ends its highlight before the closing frame; an unlit
+        // one has nothing to end.
+        let lit_end = format!(" {RESET} {FRAME}│{RESET}");
+        let unlit_end = format!("  {FRAME}│{RESET}");
+        assert!(wrap(true, false, false).ends_with(&lit_end));
+        assert!(wrap(false, true, true).ends_with(&lit_end));
+        assert!(wrap(false, false, true).ends_with(&unlit_end));
+        assert!(wrap(true, true, false).ends_with(&unlit_end));
 
         // Inside the row: a lit row (selected, or an alert in its on phase)
         // is plain text under the outer highlight; otherwise the number is
@@ -2741,7 +3057,7 @@ mod tests {
     fn active_header_shows_its_marker_and_fills_the_row() {
         let header = |state: &State| {
             let mut out = String::new();
-            render_active_row(&mut out, &state.tabs[0].info, 30);
+            render_active_row(&mut out, &state.tabs[0].info, 0, 30);
             out
         };
         let mut state = state_with_tabs(&["active", "other"]);
@@ -2800,6 +3116,356 @@ mod tests {
         assert!(state.on_pane_update(&shown));
         assert_eq!(state.geometry_reasserts, 1);
         assert!(state.vis.visible);
+
+        // Floating but unfocused (a click into the pane below), or focused
+        // but tiled: not the shown picker.
+        let mut state = state_with_tabs(&["active"]);
+        state.ready = true;
+        state.vis.float_visible = true;
+        state.on_pane_update(&own_pane_update(|p| p.is_floating = true));
+        assert!(!state.vis.pane_focused);
+        state.on_pane_update(&own_pane_update(|p| p.is_focused = true));
+        assert!(!state.vis.pane_focused);
+        // Nor is a terminal pane that happens to carry the plugin's id:
+        // terminal and plugin panes are numbered separately.
+        let terminal = PaneManifest {
+            panes: HashMap::from([(
+                0,
+                vec![PaneInfo {
+                    is_floating: true,
+                    is_focused: true,
+                    is_selectable: true,
+                    ..PaneInfo::default()
+                }],
+            )]),
+        };
+        state.on_pane_update(&terminal);
+        assert!(!state.vis.pane_focused);
+        assert_eq!(state.own.counted, Some(false));
+    }
+
+    /// The picker's own pane shown as a focused floating pane of
+    /// `cols` × `rows`.
+    fn shown_floating(cols: usize, rows: usize) -> PaneManifest {
+        own_pane_update(|p| {
+            p.is_floating = true;
+            p.is_focused = true;
+            p.is_selectable = true;
+            p.pane_columns = cols;
+            p.pane_rows = rows;
+        })
+    }
+
+    #[test]
+    fn a_new_size_larger_than_the_box_requests_the_target_at_once() {
+        let draw = |state: &mut State, rows, cols| {
+            let mut out = String::new();
+            state.draw(&mut out, rows, cols);
+            out
+        };
+        let esc = KeyWithModifier::new(BareKey::Esc);
+        let mut state = state_with_tabs(&["active", "alpha"]);
+        state.ready = true;
+        state.refresh_scores();
+        // Shown at its 60×20 target (the rising edge re-asserts anyway, and
+        // the render at that size settles it), then closed.
+        state.on_pane_update(&shown_floating(60, 20));
+        assert!(state.own.resize_pending);
+        draw(&mut state, 20, 60);
+        assert!(!state.own.resize_pending);
+        assert!(state.handle_key(&esc));
+        // Renders while hidden request nothing, which would show the closed
+        // picker again: at its size, or smaller, as when a resize requested
+        // before Esc lands late.
+        draw(&mut state, 20, 60);
+        draw(&mut state, 15, 50);
+        draw(&mut state, 20, 60);
+        assert!(!state.own.resize_pending);
+        // The reopen at Zellij's default geometry: the first render asks
+        // for the target and draws the box top-left, every row box-wide and
+        // nothing below it, so the pane shrinks to it intact.
+        let out = draw(&mut state, 23, 98);
+        assert!(state.own.resize_pending);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 20);
+        assert!(lines.iter().all(|line| visible_len(line) == 60));
+        assert!(lines[0].starts_with(&format!("{FRAME}╭")));
+        assert!(lines[19].starts_with(&format!("{FRAME}╰")));
+        assert_eq!(state.list_area.map(|a| (a.top, a.left)), Some((5, 0)));
+        // Larger in one dimension only is still larger.
+        draw(&mut state, 20, 98);
+        assert!(state.own.resize_pending);
+        draw(&mut state, 23, 60);
+        assert!(state.own.resize_pending);
+        // At the target size the request is done.
+        draw(&mut state, 20, 60);
+        assert!(!state.own.resize_pending);
+        // The open picker taken into another tab (`move_to_focused_tab`)
+        // comes back at the default geometry without a close in between.
+        draw(&mut state, 23, 98);
+        assert!(state.own.resize_pending);
+
+        // Esc while a resize is still on its way: neither a hidden render
+        // at the old size nor the late one at the box size requests again,
+        // and the next reopen does.
+        draw(&mut state, 23, 98);
+        assert!(state.own.resize_pending);
+        state.handle_key(&esc);
+        state.own.resize_pending = false; // watch for new requests only
+        draw(&mut state, 23, 98);
+        assert!(!state.own.resize_pending);
+        draw(&mut state, 20, 60);
+        draw(&mut state, 23, 98);
+        assert!(state.own.resize_pending);
+
+        // A tiled picker keeps the size its layout gives it: the request
+        // from `Granted` is dropped with its first report, which re-renders
+        // the box centred, and new sizes request nothing.
+        let mut state = state_with_tabs(&["active"]);
+        state.ready = true;
+        state.resize_pane();
+        draw(&mut state, 24, 80);
+        let tiled = own_pane_update(|p| {
+            p.is_focused = true;
+            p.pane_columns = 80;
+            p.pane_rows = 24;
+        });
+        assert!(state.on_pane_update(&tiled));
+        assert!(!state.own.resize_pending);
+        draw(&mut state, 30, 100);
+        assert!(!state.own.resize_pending);
+    }
+
+    #[test]
+    fn a_pending_resize_gets_a_moment_before_the_box_is_centred() {
+        let draw = |state: &mut State, rows, cols| {
+            let mut out = String::new();
+            state.draw(&mut out, rows, cols);
+            out
+        };
+        let esc = KeyWithModifier::new(BareKey::Esc);
+        // Shown at its target, then closed.
+        let mut state = state_with_tabs(&["active", "alpha"]);
+        state.ready = true;
+        state.refresh_scores();
+        state.on_pane_update(&shown_floating(60, 20));
+        draw(&mut state, 20, 60);
+        assert!(state.handle_key(&esc));
+
+        // A pane stuck larger (e.g. fullscreen): once the re-assert budget
+        // is spent, the request still gets `RESIZE_TIMEOUT` to land; then
+        // the box is centred with padding around it, and renders at that
+        // size request nothing more.
+        draw(&mut state, 24, 80);
+        let stuck = shown_floating(80, 24);
+        for _ in 0..MAX_GEOMETRY_REASSERTS {
+            state.on_pane_update(&stuck);
+        }
+        assert!(!state.on_pane_update(&stuck)); // budget spent, no give-up yet
+        assert!(state.own.resize_pending);
+        state.on_pane_update(&stuck); // one timeout per request
+        let timeouts = |state: &State| {
+            state
+                .timers
+                .pending
+                .iter()
+                .filter(|(k, _)| matches!(k, TimerKind::ResizeTimeout { .. }))
+                .count()
+        };
+        assert_eq!(timeouts(&state), 1);
+        assert!(state.on_timer(RESIZE_TIMEOUT)); // re-render, centred
+        assert!(!state.own.resize_pending);
+        assert!(!state.on_resize_timeout(state.own.resize_generation));
+        assert!(!state.on_pane_update(&stuck));
+        let out = draw(&mut state, 24, 80);
+        assert!(!state.own.resize_pending);
+        assert_eq!(out.lines().count(), 24);
+        assert!(out.lines().all(|line| visible_len(line) == 80));
+
+        // Reports from before the first request landed (Zellij 0.45 sends
+        // a few when it moves the picker between tabs) spend the budget,
+        // but only the render at the target size ends the request, and the
+        // timeout then has nothing left to do.
+        state.handle_key(&esc);
+        draw(&mut state, 22, 98);
+        let outdated = shown_floating(100, 24);
+        for _ in 0..=MAX_GEOMETRY_REASSERTS {
+            state.on_pane_update(&outdated);
+        }
+        assert!(state.own.resize_pending);
+        draw(&mut state, 22, 98);
+        assert!(state.own.resize_pending);
+        draw(&mut state, 20, 60);
+        assert!(!state.own.resize_pending);
+        assert!(!state.on_timer(RESIZE_TIMEOUT));
+        // A timeout armed before a newer request has nothing to say either.
+        draw(&mut state, 22, 98);
+        for _ in 0..=MAX_GEOMETRY_REASSERTS {
+            state.on_pane_update(&outdated);
+        }
+        draw(&mut state, 23, 98);
+        assert!(!state.on_timer(RESIZE_TIMEOUT));
+        assert!(state.own.resize_pending);
+        // A report at the target size ends a request, whatever the last
+        // render saw.
+        state.on_pane_update(&shown_floating(60, 20));
+        assert!(!state.own.resize_pending);
+        draw(&mut state, 20, 60);
+    }
+
+    #[test]
+    fn esc_keeps_a_chosen_selection_and_a_jump_starts_at_the_top() {
+        let esc = KeyWithModifier::new(BareKey::Esc);
+        let ctrl_g = KeyWithModifier::new(BareKey::Char('g')).with_ctrl_modifier();
+        let selected = |state: &State| state.scored[state.selected].tab.name.clone();
+        let mut state = state_with_tabs(&["active", "alpha", "beta", "gamma"]);
+        state.ready = true;
+        state.refresh_scores();
+        // Moved to beta and closed: beta stays selected, also when gamma
+        // starts calling for you while the picker is hidden.
+        state.move_selection(Direction::Down);
+        assert!(state.handle_key(&esc));
+        assert_eq!(selected(&state), "beta");
+        start_calling(&mut state, 3, true);
+        assert_eq!(listed_names(&state), vec!["gamma", "alpha", "beta"]);
+        assert_eq!(selected(&state), "beta");
+        // Typed down to alpha and closed: the query goes, alpha stays.
+        for c in "alp".chars() {
+            state.handle_key(&KeyWithModifier::new(BareKey::Char(c)));
+        }
+        assert_eq!(listed_names(&state), vec!["alpha"]);
+        assert!(state.handle_key(&ctrl_g));
+        assert_eq!(state.query, "");
+        assert_eq!(listed_names(&state), vec!["gamma", "alpha", "beta"]);
+        assert_eq!(selected(&state), "alpha");
+        // A jump leaves a fresh list for the next open.
+        assert!(state.handle_key(&KeyWithModifier::new(BareKey::Enter)));
+        assert_eq!(state.selected, 0);
+        assert!(!state.selection_moved);
+
+        // Untouched, Esc leaves the selection on the first row; the picker
+        // counts as hidden at once, with the blink in its off phase, so the
+        // next report of its pane is a reopen. Ctrl-c closes like Esc.
+        let mut state = state_with_tabs(&["active", "alpha", "beta"]);
+        state.refresh_scores();
+        state.vis = Visibility {
+            visible: true,
+            pane_focused: true,
+            float_visible: true,
+            host_visible: None,
+        };
+        state.timers.blink_on = true;
+        assert!(state.handle_key(&esc));
+        assert_eq!(state.selected, 0);
+        assert!(!state.selection_moved);
+        assert!(!state.vis.visible && !state.vis.pane_focused);
+        assert!(!state.timers.blink_on);
+        state.move_selection(Direction::Down);
+        state.query = "x".to_string();
+        let ctrl_c = KeyWithModifier::new(BareKey::Char('c')).with_ctrl_modifier();
+        assert!(state.handle_key(&ctrl_c));
+        assert_eq!(state.query, "");
+        assert!(state.selection_moved);
+
+        // A kept selection keeps its scroll position too: 14 list rows,
+        // scrolled down to row 20 and back up to row 17.
+        let names: Vec<String> = (0..30).map(|n| format!("t{n}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut state = state_with_tabs(&names);
+        state.ready = true;
+        state.refresh_scores();
+        let render = |state: &mut State| {
+            let mut out = String::new();
+            state.render_box(&mut out, BoxPlacement::centered(20, 60, &state.size));
+        };
+        for _ in 0..20 {
+            state.move_selection(Direction::Down);
+        }
+        render(&mut state);
+        for _ in 0..3 {
+            state.move_selection(Direction::Up);
+        }
+        render(&mut state);
+        assert_eq!((state.selected, state.scroll_offset), (17, 7));
+        assert!(state.handle_key(&esc));
+        render(&mut state);
+        assert_eq!((state.selected, state.scroll_offset), (17, 7));
+    }
+
+    #[test]
+    fn the_header_count_leaves_the_picker_out() {
+        let header = |state: &mut State| {
+            let mut out = String::new();
+            state.render_box(&mut out, BoxPlacement::centered(20, 60, &state.size));
+            out.lines().nth(3).unwrap_or_default().to_string()
+        };
+        // One report from Zellij: the active tab has two terminal panes,
+        // plus the picker while it is shown.
+        let report = |state: &mut State, shown: bool| {
+            state.on_pane_update(&own_pane_update(|p| {
+                p.is_floating = shown;
+                p.is_suppressed = !shown;
+                p.is_focused = shown;
+                p.is_selectable = true;
+                p.pane_columns = 60;
+                p.pane_rows = 20;
+            }));
+            let mut tabs: Vec<TabInfo> = state.tabs.iter().map(|e| (*e.info).clone()).collect();
+            tabs[0].selectable_tiled_panes_count = 2;
+            tabs[0].selectable_floating_panes_count = usize::from(shown);
+            state.on_tab_update(tabs);
+        };
+        let mut state = state_with_tabs(&["active", "alpha"]);
+        // Before the first `PaneUpdate`: the picker is shown, as at load.
+        let mut tabs: Vec<TabInfo> = state.tabs.iter().map(|e| (*e.info).clone()).collect();
+        tabs[0].selectable_tiled_panes_count = 2;
+        tabs[0].selectable_floating_panes_count = 1;
+        state.on_tab_update(tabs);
+        assert!(header(&mut state).contains("[2]"));
+        state.ready = true;
+        report(&mut state, true);
+        assert!(header(&mut state).contains("[2]"));
+        // Zellij 0.46 keeps reporting to the hidden picker. That snapshot
+        // does not count it, and it is what the next open shows first.
+        report(&mut state, false);
+        assert!(header(&mut state).contains("[2]"));
+        report(&mut state, true);
+        assert!(header(&mut state).contains("[2]"));
+    }
+
+    #[test]
+    fn a_jump_shows_its_tab_as_the_header_of_the_next_open() {
+        let mut state = state_with_tabs(&["active", "alpha", "beta"]);
+        state.ready = true;
+        // Shown in the active tab, which has one terminal pane besides the
+        // picker; beta has three tiled panes and a floating one.
+        state.on_pane_update(&shown_floating(60, 20));
+        let mut tabs: Vec<TabInfo> = state.tabs.iter().map(|e| (*e.info).clone()).collect();
+        tabs[0].selectable_tiled_panes_count = 1;
+        tabs[0].selectable_floating_panes_count = 1;
+        tabs[2].selectable_tiled_panes_count = 3;
+        tabs[2].selectable_floating_panes_count = 1;
+        state.on_tab_update(tabs);
+        state.move_selection(Direction::Down);
+        assert_eq!(state.scored[state.selected].tab.name, "beta");
+        assert!(state.handle_key(&KeyWithModifier::new(BareKey::Enter)));
+        // Hidden in the old tab, the picker hears nothing until it is open
+        // again, and its first render already shows beta as the header and
+        // no tab counting the picker.
+        let mut out = String::new();
+        state.render_box(&mut out, BoxPlacement::centered(20, 60, &state.size));
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[3].contains("beta") && lines[3].contains("[4]"));
+        assert_eq!(listed_names(&state), vec!["active", "alpha"]);
+        assert!(lines[5].contains("active") && lines[5].contains("[1]"));
+        // Jumping on before Zellij's next report: that snapshot counts the
+        // picker nowhere, so beta keeps all four of its panes.
+        assert!(state.handle_key(&KeyWithModifier::new(BareKey::Enter)));
+        let mut out = String::new();
+        state.render_box(&mut out, BoxPlacement::centered(20, 60, &state.size));
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[3].contains("active") && lines[3].contains("[1]"));
+        assert!(lines[5].contains("beta") && lines[5].contains("[4]"));
     }
 
     #[test]
@@ -2848,7 +3514,16 @@ mod tests {
         // A single tab is the header, so the empty query lists nothing.
         let mut state = state_with_tabs(&["only"]);
         state.refresh_scores();
-        assert!(render(&mut state).contains("no other tabs"));
+        // Once, centred on the middle list row: box row 5 (border, prompt,
+        // separator, header, separator) plus half of the 14 list rows.
+        let out = render(&mut state);
+        let rows: Vec<&str> = out.lines().collect();
+        let hits: Vec<usize> = (0..rows.len())
+            .filter(|&i| rows[i].contains("no other tabs"))
+            .collect();
+        assert_eq!(hits, vec![12]);
+        let at = rows[12].find("no other tabs").unwrap_or_default();
+        assert_eq!(visible_len(&rows[12][..at]), 3 + (54 - 13) / 2);
         state.query = "zzz".to_string();
         state.refresh_scores();
         assert!(render(&mut state).contains("no matches"));
@@ -2919,6 +3594,22 @@ mod tests {
         state.refresh_scores();
         assert!(state.scored.is_empty());
         assert_eq!(state.selected, 0);
+
+        // The typo pass folds case like nucleo's smart case: a lowercase
+        // query finds an uppercase name.
+        let mut state = state_with_tabs(&["active", "BACKEND"]);
+        state.query = "bakkend".to_string();
+        state.refresh_scores();
+        assert_eq!(listed_names(&state), vec!["BACKEND"]);
+        assert_eq!(state.scored[0].kind, MatchKind::Approx(1));
+        // Names up to `APPROX_MAX_NAME_CHARS` chars get the typo pass,
+        // longer ones do not.
+        let fits = format!("{}back", "z".repeat(APPROX_MAX_NAME_CHARS - 4));
+        let too_long = format!("z{fits}");
+        let mut state = state_with_tabs(&["active", &fits, &too_long]);
+        state.query = "bxck".to_string();
+        state.refresh_scores();
+        assert_eq!(listed_names(&state), vec![fits.as_str()]);
     }
 
     #[test]
@@ -2951,6 +3642,7 @@ mod tests {
         assert!(!shown.ends_with('\n'));
         assert_eq!(lines[1].trim(), "");
         assert!(lines[2].contains('╭') && lines[21].contains('╰'));
+        assert!(lines[3].contains(&format!("{PROMPT}❯{RESET} {REVERSE} {RESET}")));
         assert_eq!(lines[22].trim(), "");
         assert!(state.list_area.is_some());
         // Before the permission is granted: blank rows only, no list area.
@@ -3025,5 +3717,166 @@ mod tests {
         state.render_box(&mut out, BoxPlacement::centered(3, 80, &state.size));
         assert_eq!(out.lines().count(), 3);
         assert!(state.list_area.is_none());
+        // The smallest box that still gets its frame, and one cell less in
+        // either dimension.
+        for (rows, cols, framed) in [
+            (4, 60, true),
+            (20, 20, true),
+            (3, 60, false),
+            (20, 19, false),
+        ] {
+            let mut out = String::new();
+            state.render_box(&mut out, BoxPlacement::centered(rows, cols, &state.size));
+            assert_eq!(out.contains('╭'), framed, "{rows}x{cols}");
+            assert_eq!(state.list_area.is_some(), framed, "{rows}x{cols}");
+        }
+    }
+
+    #[test]
+    fn update_routes_events_and_drops_input_before_the_permission() {
+        use AttentionSource::ProgramStatus;
+        use AttentionStatus::NeedsYou;
+        let key = |c| Event::Key(KeyWithModifier::new(BareKey::Char(c)));
+        let mut state = state_with_tabs(&["active", "alpha", "beta"]);
+        state.refresh_scores();
+        // Before the permission: keys and the wheel change nothing.
+        assert!(!state.update(key('a')));
+        assert!(!state.update(Event::Mouse(Mouse::ScrollDown(1))));
+        assert_eq!((state.query.as_str(), state.selected), ("", 0));
+        // `Granted` asks the host for the plugin ids, which a host test
+        // cannot answer, so the test sets `ready` itself.
+        state.ready = true;
+        assert!(state.update(Event::Mouse(Mouse::ScrollDown(1))));
+        assert_eq!(state.selected, 1);
+        // Tab and pane reports reach their handlers: alpha's agent waits.
+        let mut tabs: Vec<TabInfo> = state.tabs.iter().map(|e| (*e.info).clone()).collect();
+        tabs[1].attention.status = NeedsYou;
+        assert!(state.update(Event::TabUpdate(tabs)));
+        let report = manifest(vec![(1, attention_pane(NeedsYou, Some(ProgramStatus)))]);
+        assert!(state.update(Event::PaneUpdate(report)));
+        assert!(state.calling.contains(&1));
+        // The host's visibility signal, and the blink tick it starts.
+        state.vis.pane_focused = true;
+        state.vis.float_visible = true;
+        assert!(!state.update(Event::Visible(false)));
+        assert_eq!(state.vis.host_visible, Some(false));
+        assert!(state.update(Event::Visible(true)));
+        assert!(state.update(Event::Timer(BLINK_INTERVAL)));
+        assert!(state.timers.blink_on);
+        // Keys after the permission, and an event nobody subscribed to.
+        assert!(state.update(key('b')));
+        assert_eq!(state.query, "b");
+        assert!(!state.update(Event::InputReceived));
+        // `render` draws through `draw`, size request included.
+        state.own.floating = true;
+        state.render(23, 98);
+        assert_eq!(state.own.rendered, (23, 98));
+        assert!(state.own.resize_pending);
+    }
+
+    #[test]
+    fn keys_and_wheel_move_the_selection_and_other_chords_do_nothing() {
+        let plain = |c| KeyWithModifier::new(BareKey::Char(c));
+        let ctrl = |c| KeyWithModifier::new(BareKey::Char(c)).with_ctrl_modifier();
+        let alt = |c| KeyWithModifier::new(BareKey::Char(c)).with_alt_modifier();
+        let mut state = state_with_tabs(&["active", "alpha", "beta", "gamma"]);
+        state.ready = true;
+        state.refresh_scores();
+        // Down, Tab and Ctrl-n/j move down, Up and Ctrl-p/k up, both
+        // wrapping around; the wheel stops at the ends.
+        let moves = [
+            (KeyWithModifier::new(BareKey::Down), 1),
+            (KeyWithModifier::new(BareKey::Tab), 2),
+            (ctrl('n'), 0),
+            (KeyWithModifier::new(BareKey::Up), 2),
+            (ctrl('p'), 1),
+            (ctrl('j'), 2),
+            (ctrl('k'), 1),
+        ];
+        for (key, row) in moves {
+            assert!(state.handle_key(&key));
+            assert_eq!(state.selected, row);
+        }
+        assert!(state.handle_mouse(&Mouse::ScrollUp(3)));
+        assert_eq!(state.selected, 0);
+        assert!(!state.handle_mouse(&Mouse::ScrollUp(3)));
+        // Ctrl or Alt with a letter or a digit is no input: nothing typed,
+        // no jump.
+        for key in [ctrl('x'), alt('a'), alt('3'), ctrl('3')] {
+            assert!(!state.handle_key(&key));
+        }
+        assert_eq!(state.query, "");
+        assert!(state.tabs[0].info.active);
+        // Plain p, k, n and j type.
+        for c in "pknj".chars() {
+            assert!(state.handle_key(&plain(c)));
+        }
+        assert_eq!(state.query, "pknj");
+    }
+
+    #[test]
+    fn the_query_takes_printable_chars_up_to_its_cap() {
+        let key = |c| KeyWithModifier::new(BareKey::Char(c));
+        let mut state = state_with_tabs(&["active", "t2"]);
+        // A control char (e.g. from a paste) is no input.
+        assert!(!state.handle_key(&key('\u{7}')));
+        assert_eq!(state.query, "");
+        for _ in 0..MAX_QUERY_CHARS {
+            state.handle_key(&key('x'));
+        }
+        assert_eq!(state.query.chars().count(), MAX_QUERY_CHARS);
+        // At the cap neither a letter nor a digit gets in.
+        assert!(!state.handle_key(&key('y')));
+        assert!(!state.handle_key(&key('2')));
+        assert_eq!(state.query.chars().count(), MAX_QUERY_CHARS);
+    }
+
+    #[test]
+    fn the_list_scrolls_just_enough_to_show_the_selection() {
+        let names: Vec<String> = (0..30).map(|n| format!("t{n}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut state = state_with_tabs(&names);
+        state.refresh_scores();
+        let render = |state: &mut State| {
+            let mut out = String::new();
+            state.render_box(&mut out, BoxPlacement::centered(20, 60, &state.size));
+        };
+        // 14 list rows: down to row 20 scrolls by 7, back up to row 10
+        // keeps that, up to row 5 scrolls up to it.
+        for (selected, offset) in [(20, 7), (10, 7), (5, 5)] {
+            state.selected = selected;
+            render(&mut state);
+            assert_eq!(state.scroll_offset, offset, "row {selected}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_fills_its_area_is_not_cut() {
+        // 30 cells: "1 - " (4), the name, "  " and "[0]" (3), so 21 chars
+        // fit exactly, and a 22-char name is cut to 20 and an ellipsis.
+        let row = |name: &str| {
+            let s = Scored {
+                kind: MatchKind::Listed,
+                tab: Rc::new(TabInfo {
+                    name: name.to_string(),
+                    ..TabInfo::default()
+                }),
+                indices: Vec::new(),
+            };
+            let style = HighlightStyle {
+                selected: true,
+                ..HighlightStyle::default()
+            };
+            let mut out = String::new();
+            render_row(&mut out, &s, style, 30, 1);
+            out
+        };
+        let fits = "a".repeat(21);
+        let out = row(&fits);
+        assert!(out.contains(&fits) && !out.contains('…'));
+        assert_eq!(visible_len(&out), 30);
+        let out = row(&"a".repeat(22));
+        assert!(out.contains(&format!("{}…", "a".repeat(20))));
+        assert_eq!(visible_len(&out), 30);
     }
 }
